@@ -1,0 +1,124 @@
+# Build de los bundles Linux de Quorb (.deb + .AppImage) y verificación
+# con el build-verify container (M0.5). Solo corre con tags SemVer (`vX.Y.Z`).
+# El CI de PR vive en `ci.yml` y se queda con los tests de dev.
+#
+name: Build Linux release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-linux-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-release:
+    name: Build deb + AppImage for ${{ github.ref_name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - name: Validate tag is SemVer (X.Y.Z)
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if ! echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag no SemVer: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          echo "Versión: $TAG"
+
+      - name: Checkout with full history and tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Rust stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Tauri 2 Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            curl \
+            wget \
+            file \
+            patchelf \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsecret-1-dev \
+            libnotify-dev
+
+      - name: Install locked frontend dependencies
+        run: npm ci
+
+      - name: Frontend and script tests
+        run: npm test
+
+      - name: Typecheck and build
+        run: npm run build
+
+      - name: Rust tests with locked dependencies
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      - name: Validate tag matches package.json version
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "v${PKG_VERSION}" != "$GITHUB_REF_NAME" ]; then
+            echo "el tag $GITHUB_REF_NAME no coincide con package.json version v${PKG_VERSION}" >&2
+            exit 1
+          fi
+          echo "✔ tag $GITHUB_REF_NAME coincide con package.json"
+
+      - name: Build Linux bundles (deb + AppImage)
+        run: npm run app:build
+
+      - name: Build build-verify image (M0.5)
+        run: docker build -t quorb-build-verify .testcontainer
+
+      - name: Stage bundles for runtime verification
+        run: |
+          mkdir -p "$RUNNER_TEMP/quorb-bundles"
+          cp src-tauri/target/release/bundle/deb/*.deb "$RUNNER_TEMP/quorb-bundles/" || true
+          cp src-tauri/target/release/bundle/appimage/*.AppImage "$RUNNER_TEMP/quorb-bundles/" || true
+          ls -la "$RUNNER_TEMP/quorb-bundles"
+
+      - name: Verify bundles in clean Ubuntu 22.04
+        env:
+          BUNDLE_DIR: ${{ runner.temp }}/quorb-bundles
+        run: |
+          [ -n "$(ls "$BUNDLE_DIR"/*.deb 2>/dev/null)" ] || { echo "no .deb produced" >&2; exit 1; }
+          [ -n "$(ls "$BUNDLE_DIR"/*.AppImage 2>/dev/null)" ] || { echo "no .AppImage produced" >&2; exit 1; }
+          docker run --rm -v "$BUNDLE_DIR:/artifacts" --platform linux/amd64 quorb-build-verify
+
+      - name: Upload Linux bundles as release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: quorb-linux-${{ github.ref_name }}
+          path: ${{ runner.temp }}/quorb-bundles
+          if-no-files-found: error
