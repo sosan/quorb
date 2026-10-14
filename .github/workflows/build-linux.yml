@@ -73,6 +73,22 @@ jobs:
             libsecret-1-dev \
             libnotify-dev
 
+      # Pin `linuxdeploy-plugin-appimage` to the last stable release that is
+      # compatible with `linuxdeploy` 1-alpha (07333c6, which Tauri 2.12.1 uses).
+      # The `continuous` build of the plugin (Tauri's default) bumped the
+      # `--plugin-api-version` contract and crashes with exit code 6 on this
+      # combo. Fix: pre-download the plugin to a tools dir, expose
+      # TAURI_BUNDLER_TOOLS so Tauri uses our versions instead of its cache.
+      - name: Pin linuxdeploy plugin (1-alpha-20250213-1)
+        env:
+          LINUXDEPLOY_TOOLS_DIR: ${{ runner.temp }}/quorb-bundler-tools
+        run: |
+          mkdir -p "$LINUXDEPLOY_TOOLS_DIR"
+          curl -fsSL -o "$LINUXDEPLOY_TOOLS_DIR/linuxdeploy-plugin-appimage.AppImage" \
+            "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-appimage-x86_64.AppImage"
+          chmod +x "$LINUXDEPLOY_TOOLS_DIR/linuxdeploy-plugin-appimage.AppImage"
+          ls -la "$LINUXDEPLOY_TOOLS_DIR"
+
       - name: Install locked frontend dependencies
         run: npm ci
 
@@ -96,6 +112,8 @@ jobs:
           echo "✔ tag $GITHUB_REF_NAME coincide con package.json"
 
       - name: Build Linux bundles (deb + AppImage)
+        env:
+          TAURI_BUNDLER_TOOLS: ${{ runner.temp }}/quorb-bundler-tools
         run: npm run app:build
 
       - name: Build build-verify image (M0.5)

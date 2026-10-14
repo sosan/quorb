@@ -23,6 +23,7 @@ sudo apt-get install -y --no-install-recommends \
   librsvg2-dev \
   libsecret-1-dev \
   libnotify-dev \
+  libfuse2 \
   dbus \
   dbus-x11 \
   xvfb
