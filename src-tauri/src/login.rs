@@ -261,7 +261,7 @@ fn split_login_command(command: &str) -> Result<(String, Vec<String>), String> {
             '"' => {
                 in_token = true;
                 let mut closed = false;
-                for c2 in chars.by_ref() {
+                while let Some(c2) = chars.next() {
                     if c2 == '"' {
                         closed = true;
                         break;
@@ -406,7 +406,7 @@ mod tests {
             Ok(("/opt/mis herramientas/claude".into(), vec!["login".into()]))
         );
         assert_eq!(
-            split_login_command(r"claude 'mi sesión' \"otra\" c\adena"),
+            split_login_command("claude 'mi sesión' \"otra\" c\\adena"),
             Ok(("claude".into(), vec!["mi sesión".into(), "otra".into(), "cadena".into()]))
         );
         // Los metacaracteres de shell quedan como argumentos literales, no como
