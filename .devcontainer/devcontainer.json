@@ -10,6 +10,9 @@
       "version": "stable"
     }
   },
+  "runArgs": [
+    "--tmpfs=/dev/shm:rw,nosuid,nodev,exec"
+  ],
   "forwardPorts": [1430],
   "mounts": [
     "source=quorb-cargo-home,target=/usr/local/cargo,type=volume",
