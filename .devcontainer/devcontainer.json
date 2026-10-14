@@ -11,7 +11,8 @@
     }
   },
   "runArgs": [
-    "--tmpfs=/dev/shm:rw,nosuid,nodev,exec"
+    "--tmpfs=/dev/shm:rw,nosuid,nodev,exec",
+    "--tmpfs=/tmp:rw,exec,nosuid,nodev"
   ],
   "forwardPorts": [1430],
   "mounts": [
