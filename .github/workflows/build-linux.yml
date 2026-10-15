@@ -104,7 +104,7 @@ jobs:
           TAURI_BUNDLER_TOOLS: ${{ runner.temp }}/quorb-bundler-tools
         run: npm run app:build
 
-      - name: Build build-verify image (M0.5)
+      - name: Build build-verify image
         run: docker build -t quorb-build-verify .testcontainer
 
       - name: Stage bundles for runtime verification

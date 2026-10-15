@@ -1,4 +1,4 @@
-# Testcontainer de Quorb — build-verify (M0.5)
+# Testcontainer de Quorb — build-verify
 
 Contenedor que valida los **artefactos de build** de Quorb (`.deb` y `.AppImage`)
 en una **Ubuntu 22.04 limpia** (sin toolchain: sin Node, sin Rust, sin
