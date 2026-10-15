@@ -63,20 +63,32 @@ impl Env {
 /// efectos secundarios, **thread-safe** (los tests la llaman directamente
 /// sin tocar `std::env`).
 pub fn detect_wm_info_from_env(env: &Env) -> WindowManagerInfo {
-    let is_wayland = env.wayland_display.is_some()
-        || env.xdg_session_type.as_deref().map(|s| s.eq_ignore_ascii_case("wayland")).unwrap_or(false)
-        || env
+    // Normaliza el string vacío como "ausente" para TODOS los checks, igual
+    // que `Env::from_process`: si el caller construye el `Env` a mano y le
+    // pasa `Some("")` (los tests lo hacen), un string vacío no debe contar
+    // como señal de Wayland ni aparecer en el struct.
+    let non_empty = |opt: &Option<String>| opt.clone().filter(|s| !s.is_empty());
+    let env_n = Env {
+        wayland_display: non_empty(&env.wayland_display),
+        xdg_session_type: non_empty(&env.xdg_session_type),
+        desktop_session: non_empty(&env.desktop_session),
+        xdg_current_desktop: non_empty(&env.xdg_current_desktop),
+    };
+
+    let is_wayland = env_n.wayland_display.is_some()
+        || env_n.xdg_session_type.as_deref().map(|s| s.eq_ignore_ascii_case("wayland")).unwrap_or(false)
+        || env_n
             .xdg_current_desktop
             .as_deref()
             .map(|s| s.split(':').any(is_wayland_compositor))
             .unwrap_or(false);
 
-    let is_hyprland = env
+    let is_hyprland = env_n
         .desktop_session
         .as_deref()
         .map(|s| s.eq_ignore_ascii_case("hyprland"))
         .unwrap_or(false)
-        || env
+        || env_n
             .xdg_current_desktop
             .as_deref()
             .map(|s| s.split(':').any(|p| p.eq_ignore_ascii_case("Hyprland")))
@@ -85,21 +97,17 @@ pub fn detect_wm_info_from_env(env: &Env) -> WindowManagerInfo {
     let recommendation = recommendation(
         is_wayland,
         is_hyprland,
-        env.desktop_session.as_deref(),
-        env.xdg_current_desktop.as_deref(),
+        env_n.desktop_session.as_deref(),
+        env_n.xdg_current_desktop.as_deref(),
     );
 
-    // Se clonan los `Option<String>` del `Env` porque la firma `&Env` no permite
-    // moverlos y el struct devuelto es por valor. Es una sola llamada por
-    // apertura de Ajustes con strings <20 chars; el coste es despreciable y
-    // evita acoplar la API a `Env` por valor (los tests de Rust reciben `Env`
-    // por valor desde un literal y luego llaman con `&env`, lo que perdería
-    // el borrow si se moviesen los campos aquí).
+    // `env_n` ya clonó los `Option<String>` desde el `&Env` input (y filtró
+    // vacíos); se mueven al struct sin clones adicionales.
     WindowManagerInfo {
-        wayland_display: env.wayland_display.clone(),
-        xdg_session_type: env.xdg_session_type.clone(),
-        desktop_session: env.desktop_session.clone(),
-        xdg_current_desktop: env.xdg_current_desktop.clone(),
+        wayland_display: env_n.wayland_display,
+        xdg_session_type: env_n.xdg_session_type,
+        desktop_session: env_n.desktop_session,
+        xdg_current_desktop: env_n.xdg_current_desktop,
         is_wayland,
         is_hyprland,
         recommendation,
