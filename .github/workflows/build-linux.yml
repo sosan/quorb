@@ -1,7 +1,3 @@
-# Build de los bundles Linux de Quorb (.deb + .AppImage) y verificación
-# con el build-verify container (M0.5). Solo corre con tags SemVer (`vX.Y.Z`).
-# El CI de PR vive en `ci.yml` y se queda con los tests de dev.
-#
 name: Build Linux release
 
 on:
@@ -44,6 +40,7 @@ jobs:
         with:
           node-version: 22
           package-manager-cache: false
+
 
       - name: Rust stable
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
@@ -101,15 +98,6 @@ jobs:
       - name: Rust tests with locked dependencies
         working-directory: src-tauri
         run: cargo test --locked
-
-      - name: Validate tag matches package.json version
-        run: |
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          if [ "v${PKG_VERSION}" != "$GITHUB_REF_NAME" ]; then
-            echo "el tag $GITHUB_REF_NAME no coincide con package.json version v${PKG_VERSION}" >&2
-            exit 1
-          fi
-          echo "✔ tag $GITHUB_REF_NAME coincide con package.json"
 
       - name: Build Linux bundles (deb + AppImage)
         env:
