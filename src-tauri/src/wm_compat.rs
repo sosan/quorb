@@ -89,6 +89,12 @@ pub fn detect_wm_info_from_env(env: &Env) -> WindowManagerInfo {
         env.xdg_current_desktop.as_deref(),
     );
 
+    // Se clonan los `Option<String>` del `Env` porque la firma `&Env` no permite
+    // moverlos y el struct devuelto es por valor. Es una sola llamada por
+    // apertura de Ajustes con strings <20 chars; el coste es despreciable y
+    // evita acoplar la API a `Env` por valor (los tests de Rust reciben `Env`
+    // por valor desde un literal y luego llaman con `&env`, lo que perdería
+    // el borrow si se moviesen los campos aquí).
     WindowManagerInfo {
         wayland_display: env.wayland_display.clone(),
         xdg_session_type: env.xdg_session_type.clone(),
