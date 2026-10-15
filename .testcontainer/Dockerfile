@@ -1,4 +1,4 @@
-# Build-verify container de Quorb (M0.5)
+# Build-verify container de Quorb
 #
 # Imagen de runtime de Ubuntu 22.04 LIMPIA (sin toolchain: sin Node, sin Rust,
 # sin build-essential) que replica una máquina de usuario final. Se usa para
@@ -37,6 +37,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # /artifacts los monta el host (dist/); el entrypoint los valida.
 RUN mkdir -p /artifacts /opt
 WORKDIR /opt
-COPY verify-deb.sh verify-appimage.sh verify.sh /usr/local/bin/
+COPY --chmod=755 verify-deb.sh verify-appimage.sh verify.sh /usr/local/bin/
 
 ENTRYPOINT ["/usr/local/bin/verify.sh"]
