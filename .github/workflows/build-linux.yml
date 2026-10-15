@@ -103,8 +103,13 @@ jobs:
           test -n "$APPIMAGE" || { echo "no .AppImage produced" >&2; exit 1; }
           chmod +x "$APPIMAGE"
           echo "Lanzando $APPIMAGE directamente (xvfb + dbus, timeout 60s)..."
+          # `timeout` devuelve 124 al matar un proceso que seguía vivo: con
+          # bash -e (default de GitHub Actions) eso aborta el script ANTES de
+          # llegar al `if`. Suspender errexit en este bloque.
+          set +e
           timeout -k 10 60 dbus-run-session -- xvfb-run -a "$APPIMAGE" >/tmp/appimage-launch.log 2>&1
           code=$?
+          set -e
           if [ "$code" -eq 124 ]; then
             echo "✔ AppImage OK: montó vía FUSE y siguió vivo 60s"
           else
