@@ -68,24 +68,11 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libsecret-1-dev \
-            libnotify-dev
-
-      # Pin `linuxdeploy-plugin-appimage` to the last AppImage Type-1 release
-      # that is compatible with the `apprun-old` runtime Tauri downloads.
-      # Diagnosis: `1-alpha-20250213-1` (Type 2, static-pie) writes an AppImage
-      # payload that `apprun-old` cannot mount — the resulting bundle fails
-      # with `Can't open squashfs image: Bad address` and `fuse: memory
-      # allocation failed` when launched. `1-alpha-20230713-1` is a Type-1
-      # (dynamically linked) plugin that `apprun-old` handles correctly.
-      - name: Pin linuxdeploy plugin (1-alpha-20230713-1, Type-1)
-        env:
-          LINUXDEPLOY_TOOLS_DIR: ${{ runner.temp }}/quorb-bundler-tools
-        run: |
-          mkdir -p "$LINUXDEPLOY_TOOLS_DIR"
-          curl -fsSL -o "$LINUXDEPLOY_TOOLS_DIR/linuxdeploy-plugin-appimage.AppImage" \
-            "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/1-alpha-20230713-1/linuxdeploy-plugin-appimage-x86_64.AppImage"
-          chmod +x "$LINUXDEPLOY_TOOLS_DIR/linuxdeploy-plugin-appimage.AppImage"
-          ls -la "$LINUXDEPLOY_TOOLS_DIR"
+            libnotify-dev \
+            libfuse2 \
+            xvfb \
+            dbus \
+            dbus-x11
 
       - name: Install locked frontend dependencies
         run: npm ci
@@ -104,6 +91,32 @@ jobs:
         env:
           TAURI_BUNDLER_TOOLS: ${{ runner.temp }}/quorb-bundler-tools
         run: npm run app:build
+
+      # Lanza el AppImage SIN --appimage-extract-and-run: el runner es una VM
+      # con FUSE real, así que este paso ejercita el camino de montaje completo
+      # (runtime embebido + fusermount + payload squashfs). El testcontainer
+      # (verify-appimage.sh) no puede hacerlo porque Docker no tiene /dev/fuse.
+      # Exige que el proceso siga vivo 60s (exit 124 = timeout = OK).
+      - name: Launch AppImage directly (FUSE mount path)
+        run: |
+          APPIMAGE="$(ls src-tauri/target/release/bundle/appimage/*.AppImage 2>/dev/null | head -1)"
+          test -n "$APPIMAGE" || { echo "no .AppImage produced" >&2; exit 1; }
+          chmod +x "$APPIMAGE"
+          echo "Lanzando $APPIMAGE directamente (xvfb + dbus, timeout 60s)..."
+          # `timeout` devuelve 124 al matar un proceso que seguía vivo: con
+          # bash -e (default de GitHub Actions) eso aborta el script ANTES de
+          # llegar al `if`. Suspender errexit en este bloque.
+          set +e
+          timeout -k 10 60 dbus-run-session -- xvfb-run -a "$APPIMAGE" >/tmp/appimage-launch.log 2>&1
+          code=$?
+          set -e
+          if [ "$code" -eq 124 ]; then
+            echo "✔ AppImage OK: montó vía FUSE y siguió vivo 60s"
+          else
+            echo "✖ AppImage falló (código $code). Log:" >&2
+            tail -40 /tmp/appimage-launch.log >&2
+            exit 1
+          fi
 
       - name: Build build-verify image
         run: docker build -t quorb-build-verify .testcontainer
