@@ -162,10 +162,14 @@ jobs:
           [ -n "$(ls "$BUNDLE_DIR"/*.AppImage 2>/dev/null)" ] || { echo "no .AppImage produced" >&2; exit 1; }
           docker run --rm -v "$BUNDLE_DIR:/artifacts" --platform linux/amd64 quorb-build-verify
 
+      - name: Compute artifact name
+        id: artifact
+        run: echo "name=quorb-linux-manual-$(echo "${{ inputs.ref || github.ref }}" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
       - name: Upload Linux bundles as artifacts
         if: ${{ inputs.with_bundle == 'bundle' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: quorb-linux-manual-${{ inputs.ref || github.ref }}
+          name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/quorb-bundles
           if-no-files-found: error
