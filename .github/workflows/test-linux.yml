@@ -108,6 +108,22 @@ jobs:
 
       # ---- Solo si with_bundle == bundle ----
 
+      # Pin `linuxdeploy-plugin-appimage` a la última release Type-1
+      # compatible con `apprun-old` (el runtime que descarga Tauri): la
+      # `continuous` (Type 2, static-pie) escribe un payload que no monta
+      # ('Can't open squashfs image: Bad address'). Precargamos el binario y
+      # exponemos TAURI_BUNDLER_TOOLS para que Tauri use nuestra copia.
+      - name: Pin linuxdeploy plugin (1-alpha-20230713-1, Type-1)
+        if: ${{ inputs.with_bundle == 'bundle' }}
+        env:
+          LINUXDEPLOY_TOOLS_DIR: ${{ runner.temp }}/quorb-bundler-tools
+        run: |
+          mkdir -p "$LINUXDEPLOY_TOOLS_DIR"
+          curl -fsSL -o "$LINUXDEPLOY_TOOLS_DIR/linuxdeploy-plugin-appimage.AppImage" \
+            "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/1-alpha-20230713-1/linuxdeploy-plugin-appimage-x86_64.AppImage"
+          chmod +x "$LINUXDEPLOY_TOOLS_DIR/linuxdeploy-plugin-appimage.AppImage"
+          ls -la "$LINUXDEPLOY_TOOLS_DIR"
+
       - name: Build Linux bundles (deb + AppImage)
         if: ${{ inputs.with_bundle == 'bundle' }}
         env:
