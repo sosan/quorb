@@ -1,8 +1,10 @@
 # W2 — Plan de desarrollo: persistencia/discovery WSL con adaptadores inyectables (Implementar)
 
 > Esqueleto de trabajo para la fase W2 (ODD, issue #90, quorb-wsl-v1).
-> **No arranca hasta que el owner acepte W1** (checkboxes §1–§7 de
-> `W1-CONTRACT.md`). Este doc planifica CÓMO, no redecide el QUÉ de W1.
+> **Todo el contenido de este doc queda condicionado al checklist §1–§7 de
+> `W1-CONTRACT.md`** (aceptado por el owner el 2026-10-21T06:31 en la issue
+> #90). Este doc planifica CÓMO, no redecide el QUÉ de W1; cualquier decisión
+> que W2 deba reabrir se negocia con el owner antes de implementar.
 > Referencias: `W1-CONTRACT.md`, `W0-EVIDENCE.md`, issue #90 (tabla ODD).
 
 ---

@@ -217,8 +217,15 @@ las pruebas de la estrategia como default user (el que Quorb usaría).
 **Conclusión F12**: cierra el gap de W1 §3 — la estrategia `-e bash -lc`
 (con `PATH` limpio del login shell) con fallback `-e sh -c` queda **validada
 en la MISMA distro con bash real**. Implicación práctica: la detección
-`command -v bash` + `-e bash -lc` es la vía correcta cuando bash existe
-(distros Ubuntu/store o instalado vía apk como root).
+`command -v bash` + `-e bash -lc` es la vía correcta cuando bash existe.
+
+**Nota de procedencia (matiz del owner, 2026-10-21T06:31)**: hay una
+circularidad parcial en F12 — el bash validado fue **instalado por el propio
+lab** (`apk add -u root`), no venía con la distro. En distros store
+(Ubuntu/Debian) bash ya viene preinstalado; en distros importadas (la Alpine
+del lab) no, por lo que **el fallback `-e sh -c` sigue siendo necesario** en
+el contrato: `-e bash -lc` solo cuando `command -v bash` confirme su
+existencia, `-e sh -c` en caso contrario.
 
 ### F13 — Launcher kill vs terminate: state verified (F4 amplified)
 
@@ -350,6 +357,19 @@ The evidence for F7/F8/F9/F10 was produced by re-running
 - The re-run uses `Add-Content -Value` for annotation writes (so they
   append, not overwrite) — the previous Set-Content bug truncated F7–F10
   outputs to the last annotation only.
+
+> **Mutaciones de estado entre runs (matiz del owner, 2026-10-21T06:31)**:
+> a partir del run `39512692244`, el paso F12 instala bash en la distro
+> (`apk add -u root`), lo que **muta el estado de `quorb_w0`** de forma
+> persistente (rootfs modificado). Los runs posteriores (`39513898413` y
+> siguientes) ejecutan ese mismo paso sobre distros re-importadas en cada
+> run nuevo (runner efímero), así que la mutación **no se arrastra entre
+> runs** — cada run parte de una Alpine limpia re-importada. Sin embargo,
+> dentro de un mismo run, F12 (instala bash) corre ANTES que F13: F13 no
+> depende de bash (solo `sleep 60` + `--list --verbose` + `--terminate`),
+> pero queda anotado que el orden F12→F13 del workflow implica que la distro
+> ya trae bash cuando F13 la toca. Para reproducibilidad limpia se mantiene
+> este orden documentado.
 
 The F7–F10 runs answered the questions the W1 contract needs: home
 resolution does wake the distro (decide the home strategy explicitly),

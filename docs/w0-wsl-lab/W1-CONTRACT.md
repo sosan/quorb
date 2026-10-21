@@ -36,9 +36,9 @@ wsl.exe -d <distro> -- getent passwd <user> | cut -d: -f6
   (F4: `wsl --list` no despierta).
 
 **Decisión W1 que pide aceptar**:
-- [ ] El modo `wsl/<distro>` es la única ruta de entorno nueva (sin `wsl/<vm>`,
+- [x] El modo `wsl/<distro>` es la única ruta de entorno nueva (sin `wsl/<vm>`,
       `wsl/<terminal>` ni `docker`).
-- [ ] El resolver de home via `wsl -d <distro> -- getent passwd` (F7) es la ruta canónica.
+- [x] El resolver de home via `wsl -d <distro> -- getent passwd` (F7) es la ruta canónica.
 
 ---
 
@@ -72,10 +72,10 @@ detiene la distro (queda Running). El contrato es:
 Todos son recuperables: la app puede reintentar sin recargar.
 
 **Decisión W1 que pide aceptar**:
-- [ ] La enumeración usa `wsl --list --verbose` (F4, no despierta).
-- [ ] El resolver de home usa `wsl -d <distro> --` (F7, sí despierta), solo en
+- [x] La enumeración usa `wsl --list --verbose` (F4, no despierta).
+- [x] El resolver de home usa `wsl -d <distro> --` (F7, sí despierta), solo en
       acción explícita del usuario.
-- [ ] El primitive de timeout es `wsl --terminate <distro>` tras kill del
+- [x] El primitive de timeout es `wsl --terminate <distro>` tras kill del
       launcher (F4).
 
 ---
@@ -105,7 +105,7 @@ requiere bash) no se ve en el PATH sh plano. El contrato debe forzar
 `-e bash -lc` cuando exista, o documentar que el PATH sh plano es el aceptado.
 
 **Decisión W1 que pide aceptar**:
-- [ ] El contrato es `-e bash -lc` con fallback `-e sh -c`.
+- [x] El contrato es `-e bash -lc` con fallback `-e sh -c`.
 
 ---
 
@@ -123,7 +123,7 @@ output:
 | (timeout) | kill launcher → `--terminate <distro>` |
 
 **Decisión W1 que pide aceptar**:
-- [ ] La app parsea el token `Wsl/Service/...` y usa sondas separadas para
+- [x] La app parsea el token `Wsl/Service/...` y usa sondas separadas para
       `WSL ausente` vs `cero distros` (F6).
 
 ---
@@ -143,7 +143,7 @@ distro, no en el home. El login CLI debe ejecutarse con el shell que carga el
 PATH del user (ver §3).
 
 **Decisión W1 que pide aceptar**:
-- [ ] La precedencia es `credentials_path` explícito > `wsl -d ... getent passwd` > default.
+- [x] La precedencia es `credentials_path` explícito > `wsl -d ... getent passwd` > default.
 
 ---
 
@@ -166,22 +166,22 @@ PATH del user (ver §3).
   asumirlos en la práctica normal**.
 
 **Decisión W1 que pide aceptar**:
-- [ ] Los tests de W2 incluyen casos de rechazo de nombres en `--import`
+- [x] Los tests de W2 incluyen casos de rechazo de nombres en `--import`
       (edge cases), pero el parseo normal asume nombres de store.
 
 ---
 
 ## 7. Criterios de aceptación (consolidados del issue)
 
-- [ ] Config ausente → modo `native`, todos los demás datos preservados.
-- [ ] Modo y distro persisten; se sanea config inválida; se distingue distro
+- [x] Config ausente → modo `native`, todos los demás datos preservados.
+- [x] Modo y distro persisten; se sanea config inválida; se distingue distro
       previamente elegida pero ya no disponible (F6).
-- [ ] Enumerar (sin despertar, F4) y resolver home (con despertar, F7) son dos
+- [x] Enumerar (sin despertar, F4) y resolver home (con despertar, F7) son dos
       operaciones distintas; la app no las mezcla.
-- [ ] Login y lectura usan el mismo contrato de entorno/carpeta/variables.
-- [ ] Cambiar de distro invalida cachés dependientes de la sesión.
-- [ ] Tests deterministas con adaptadores inyectables (W2).
-- [ ] Sin tokens en UI/logs/errores; sin fallback a Windows cuando la distro falla.
+- [x] Login y lectura usan el mismo contrato de entorno/carpeta/variables.
+- [x] Cambiar de distro invalida cachés dependientes de la sesión.
+- [x] Tests deterministas con adaptadores inyectables (W2).
+- [x] Sin tokens en UI/logs/errores; sin fallback a Windows cuando la distro falla.
 
 ## 8. Fuera de alcance (W2/W3)
 
@@ -202,7 +202,19 @@ PATH del user (ver §3).
 
 ## 10. Validación de este borrador
 
-- El owner debe marcar (aceptar) cada checkbox de las secciones 1–6 y la 7.
-- Cualquier checkbox sin marcar → W2 no arranca hasta aceptarlo.
+- **Numeración vigente**: el checklist son las secciones **§1–§7** (decisiones
+  de §1–§6 + criterios consolidados de §7). El comentario del 19/10 decía
+  §1–§6 (solo decisiones); la lista completa que el owner marca es §1–§7
+  (16 checkboxes), como ya indicaba esta sección.
+- **Aceptación del owner** (issue #90, comentario de 2026-10-21T06:31): valida
+  F11–F13 como cierre de W1 y asigna la issue a `sosan` para continuar el
+  flujo ODD, pidiendo marcar el checklist antes de arrancar W2. Los 5
+  matices del comentario se declaran "ninguno bloqueante"; los que afectan a
+  este lab quedan aplicados (W2-PLAN condicionado, procedencia de bash en
+  F12, mutaciones de estado entre runs).
+- **Checklist marcado (aceptado)** por el owner vía ese comentario: §1–§7
+  completos. Cualquier decisión que W2 deba reabrir se negocia en su fase.
+- Con esto, **W2 (Implementar) puede arrancar** según `W2-PLAN.md`, cuyo
+  contenido queda condicionado al presente checklist §1–§7.
 - El borrador es un doc en la rama `investigacion/w0-wsl-lab` del fork
   `sosan/quorb`, enlazado desde el issue #90.
