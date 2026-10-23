@@ -11,13 +11,13 @@
 
 ## 0. Decisiones delegadas de W1 (paso 0 obligatorio — se resuelven antes de codificar)
 
-W1 §9 dejó 3 decisiones abiertas. Se cierran como primera tarea (ADR breve en
-`docs/w0-wsl-lab/ADR-W2.md` o en este mismo doc), porque condicionan la API y
-los tests:
+W1 §9 dejó 3 decisiones abiertas. Se cierran como primera tarea — ver
+**`ADR-W2.md`** (decisión, contexto, evidencia y consecuencias de cada una) —
+porque condicionan la API y los tests:
 
 | # | Decisión | Opciones | Recomendación W1 | Impacto si no se decide |
 |---|---|---|---|---|
-| 1 | Lectura de credenciales dentro de la distro | UNC (`\\wsl$\<distro>\...`) vs `wsl -d <distro> -- cat <path>` | `wsl -d ... cat` (aplica timeout con `--terminate`) | Forma del adaptador de lectura |
+| 1 | Lectura de credenciales dentro de la distro | UNC (`\\wsl$\<distro>\...`) vs `wsl -d <distro> -- cat <path>` | `wsl -d ... cat` (aplica timeout con cancelación acotada) | Forma del adaptador de lectura |
 | 2 | Sintaxis de `wsl/<distro>` en config | `"wsl/Ubuntu-22.04"`, struct `{mode, distro}`, enum | — | Serialización y saneado (§7) |
 | 3 | Distro elegida pero no disponible | Error F2 explícito vs fallback a native | Error F2 (sin fallback, W1 §7) | Comportamiento de `home()` y sesión |
 
@@ -28,9 +28,21 @@ y la **evidencia real del lab (W0-EVIDENCE.md, F7) ya confirmó** que
 `Test-Path \\wsl.localhost\quorb_w0\home\…` despierta la distro
 (Stopped → Running), igual que `wsl -d ... -- <cmd>`. No hay gap: **ambos
 despiertan**. La decisión W1 §9 se mantiene por la razón correcta: `wsl -d ...
-cat` es la única opción que permite aplicar el primitive de timeout con
-`--terminate` (F4), mientras que la UNC no ofrece forma de acotar un proceso
-colgado.
+cat` es la única opción que permite acotar un proceso colgado (timeout con
+kill del launcher + del PID remoto, §4), mientras que la UNC no ofrece forma
+de acotar un proceso colgado.
+
+**Decisiones del paso 0 — CERRADAS (2026-10-21, con evidencia del lab)**:
+
+| # | Decisión | Resultado | Base |
+|---|---|---|---|
+| 1 | Lectura de credenciales | **`wsl -d <distro> -- cat <path>`** (no UNC) | F7: UNC despierta igual que el comando; `wsl ... cat` es la única que permite acotar el proceso colgado (timeout: kill launcher + PID remoto; `--terminate` solo como recuperación explícita, ver §4). Ruta resuelta vía `getent passwd` (F5) |
+| 2 | Sintaxis de `wsl/<distro>` en config | **String `"wsl/<distro>"`** con enum de modo + distro saneada | Sencillo de serializar, validar y migrar; el parser valida el nombre contra la **enumeración real** (F4), no contra un whitelist de caracteres — el rechazo de F3 era de `wsl --import` al crear distros, no aplica a aceptar una existente (revisión owner 2026-10-23). Coherente con el formato actual de `credentials_path` |
+| 3 | Distro elegida pero no disponible | **Error F2 explícito, SIN fallback a native** | W1 §7 (sin fallback); el diagnóstico F6 distingue el caso y F14 permite resolver el error sin caer al home de otra distro |
+
+Con las 3 decisiones cerradas y F14 incorporado, la **Fase A puede arrancar**:
+definir `WslAdapter` trait + `MockWslAdapter` con los estados programables y
+los tests deterministas de W1 §7.
 
 ---
 
@@ -61,7 +73,7 @@ Windows nativo ni el futuro port macOS):
 src-tauri/src/wsl/
 ├── mod.rs          # trait WslAdapter (enumerable, resolver, diagnosticar, leer, terminar)
 ├── real.rs         # impl RealWslAdapter: corre wsl.exe (F9: system32, luego ProgramFiles\WSL)
-├── process.rs      # lanzador con timeout: kill launcher → wsl --terminate (W1 §2)
+├── process.rs      # lanzador con timeout: kill launcher → kill remoto acotado (pidfile)
 ├── errors.rs       # parseo de tokens F2: WSL_E_DISTRO_NOT_FOUND / "no installed distributions" / "Invalid command line argument"
 └── env.rs          # detección shell: -e bash -lc vs -e sh -c (W1 §3)
 ```
@@ -103,7 +115,9 @@ proceso de 32 bits que invoque `wsl.exe` (64-bit) debe usar
 
 ### Fase B — `RealWslAdapter` (procesos reales)
 - Implementar lanzador `wsl.exe` (ruta F9 con matiz Sysnative, ver §3), parseo
-  de tokens F2, timeout con `--terminate` (W1 §2), detección de shell (W1 §3).
+  de tokens F2, cancelación acotada en timeout (W1 §2 + nivel 1 de §4) con
+  `--terminate` reservado a la acción explícita del usuario, detección de
+  shell (W1 §3).
 - **cwd (verificado lab F11 + MS)**: el lab F11 (run `39509129152`) confirmó
   en el runner real que `wsl -d X -- pwd` → `/mnt/d/a/quorb/quorb` (cwd de
   Windows), y que **`wsl -d X --cd ~ -- pwd` → `/mnt/c/Users/runneradmin`
@@ -123,9 +137,71 @@ proceso de 32 bits que invoque `wsl.exe` (64-bit) debe usar
 - **Primitive de timeout VALIDADO (lab F13, run `39509129152`)**: el lab
   confirmó en runner real que `Stop-Process` del launcher (PID) → la distro
   **sigue Running** (F4), y `wsl --terminate quorb_w0` → **Stopped**
-  ("The operation completed successfully"). El contrato de W1 §2 (kill
-  launcher → `--terminate <distro>`) queda respaldado por evidencia de estado
-  explícita, no solo por la suposición.
+  ("The operation completed successfully"). F13 demuestra que `--terminate`
+  **funciona**, no que sea una cancelación segura.
+
+  **Cancelación en dos niveles (punto 1 de la revisión del owner, 2026-10-23)**
+  — `--terminate <distro>` detiene TODA la distribución: procesos y sesiones
+  ajenos a Quorb Included, no solo la operación que colgaba. W2 define:
+
+  1. **Cancelación ACOTADA (automática, en timeout)**: kill del árbol del
+     launcher local + `wsl -d <distro> -- kill <pid_remoto>` sobre el PID que
+     el propio comando escribió en un pidfile determinista (el script
+     constante de F14 hace `echo $$ > <pidfile>; exec "$1" "$@"` — el `$$` es
+     del shell dentro de la distro, no del `wsl.exe` de Windows). Tras un
+     `-KILL` al remoto si no responde. **La distro queda `Running`** y no se
+     toca nada ajeno a la operación.
+  2. **Recuperación EXPLICITA del usuario**: `wsl --terminate <distro>`
+     (el método `terminate()` del trait) solo desde una acción de UI
+     deliberada («Forzar cierre de la distro» en el diagnóstico), con aviso
+     previo de que detiene todo lo que corra en esa distro. **Nunca** como
+     primitive automático de timeout.
+
+  F13 respalda el nivel 2 (que funciona) y el nivel 1 queda como gap de
+  evidencia de lab: validar en W3 que el pidfile se escribe y que el kill
+  remoto alcanza al proceso colgado sin tumbar la distro.
+- **F14 — quoting/escapado de argv hacia `sh -c`/`bash -lc` (incorporado por
+  el owner, 2026-10-21)**: el cruce Windows→WSL no quedó cubierto por F1–F13
+  (que probaron comandos simples). La validación de W2 debe incorporar F14:
+  cómo se pasan los argv del login CLI (rutas con espacios/no ASCII, args del
+  proveedor) a `wsl -d <distro> -- sh -c '...'` / `-e bash -lc '...'` sin
+  romper por quoting. Reglas a testear en Fase B (RED/GREEN):
+  - El comando se construye como argv, no como string interpolado. **Precedente
+    verificado en `main` (revisión, 2026-10-21)**: `split_login_command` SÍ
+    existe en `login.rs` (L312, con tests de fail-closed y backslash), y la
+    variante Linux de `spawn_terminal` ya usa `terminal_invocation` =
+    `sh -c <SHELL_WRAP> sh <program> <args...>` con argv — no interpola. El
+    precedente que citaba originalmente el plan es correcto; la nota previa
+    que lo negaba se basó en un grep sobre una rama obsoleta
+    (`investigacion/w0-wsl-lab` con `login.rs` anterior al PR #122) y queda
+    descartada. F14 extiende ese patrón argv a la resolución de home y a la
+    detección de shell en WSL.
+  - La ruta del shell (`sh -c`/`bash -lc`) se pasa como argv separado, nunca
+    concatenada.
+  - **Doble frontera (punto 3 de la revisión del owner, 2026-10-23)**:
+    `Command::args` protege la línea de Windows, pero **no** lo que llega
+    dentro de `sh -c`/`bash -lc` — ahí vuelve a haber intérprete. El contrato
+    lo cierra así:
+    - El **script es una constante del código** (allowlist fijo), nunca una
+      plantilla construida con datos: p. ej. `exec "$1" "$@"` para
+      comando+args, o `cd "$1" && exec "$2" "$@"` para resolver el home.
+    - Los **datos entran como parámetros posicionales** (`$1..$n`,
+      referenciados con `"$1"`/`"$@"` entrecomillados por el propio script),
+      nunca interpolados en el texto del script.
+    - Tests de **preservación literal a través de las DOS fronteras**
+      (argv de Windows → `sh -c` → `exec`): ruta con espacio, nombre no-ASCII,
+      comilla simple y doble, `$`, backticks, glob (`*`/`?`), salto de línea,
+      string vacío y argumento que empieza por `-` — el valor debe llegar al
+      proceso final **byte a byte idéntico** a como salió de Rust.
+  - Los caracteres con significado para el shell (espacios, comillas, `$`,
+    backticks, globs) se escapan/entrecomillan de forma determinista y se
+    cubren con tests de casos: ruta con espacio, nombre no-ASCII, argumento
+    con comilla, path con `$HOME`-like, string vacío.
+  - Preferir pasar `$HOME`/ruta resuelta como variable de entorno
+    (`WSLENV`/env del proceso) en lugar de interpolarla en el script, cuando
+    sea viable (F10: stdin no se reenvía; argv/env es la vía).
+  - F14 queda como **gap de evidencia de lab** hasta validarlo con casos
+    reales en W3 (o un run F14 dedicado); el diseño lo incorpora desde ahora.
 - Tests de integración con `wsl.exe` **solo** si hay WSL disponible; si no,
   skip documentado (determinismo garantizado por mock de fase A).
 - **Gate**: tests verdes + `npm run typecheck`.
