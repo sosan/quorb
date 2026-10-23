@@ -70,7 +70,9 @@ pub trait WslAdapter: Send + Sync {
     fn resolve_home(&self, distro: &str) -> Result<PathBuf, WslError>;
 
     /// Leer un archivo dentro de la distro (decisión paso 0: `wsl -d X --
-    /// cat <path>`), con timeout aplicable vía `--terminate` (F13).
+    /// cat <path>`), con timeout por cancelación ACOTADA (nivel 1: kill del
+    /// launcher + kill del PID remoto del pidfile; la distro queda Running).
+    /// `--terminate` es el nivel 2, recuperación explícita del usuario.
     /// Devuelve el contenido como texto UTF-8 (lossy) — ver nota de
     /// implementación: el runner reutilizable devuelve `String`, no bytes.
     fn read_file(&self, distro: &str, path: &Path) -> Result<String, WslError>;
@@ -177,7 +179,8 @@ pub enum WslState {
   explícita "Detectar home WSL" en Ajustes (W1 §2), nunca en el refresco de
   la lista (F4).
 - **`read_file`** usa `wsl -d X -- cat <path>` (decisión paso 0 #1) para poder
-  aplicar el timeout con `--terminate` (F13), no UNC.
+  aplicar el timeout de cancelación acotada (nivel 1: kill del launcher +
+  kill del PID remoto por pidfile; `--terminate` queda al nivel 2), no UNC.
 - **`diagnose`** combina `wsl --version` (WSL ausente) + `wsl --list`
   (cero/no distros) + salida de distro objetivo (F2/F6).
 - **`resolve_home` — default user (F5)**: el `<user>` del `getent passwd` se
