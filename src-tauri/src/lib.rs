@@ -15,6 +15,7 @@ mod uninstall;
 mod window_clip;
 #[cfg(target_os = "windows")]
 mod windows_backdrop;
+pub mod wsl;
 
 use config::AppConfig;
 use model::UsageReport;
