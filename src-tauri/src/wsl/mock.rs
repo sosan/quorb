@@ -5,9 +5,7 @@
 //! llamadas quedan registradas, así que los tests de W1 §5/§6/§7 son
 //! deterministas y no dependen de que haya WSL en la máquina.
 
-use super::{
-    Distribution, ShellStrategy, WslAdapter, WslDiagnostic, WslError, WslState,
-};
+use super::{Distribution, ShellStrategy, WslAdapter, WslDiagnostic, WslError, WslState};
 use crate::cli_process::CommandOutput;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -109,7 +107,7 @@ impl MockWslAdapter {
 
 impl WslAdapter for MockWslAdapter {
     fn list_distributions(&self) -> Result<Vec<Distribution>, WslError> {
-        let result = self.with(|s| {
+        self.with(|s| {
             s.calls.push(WslCall::ListDistributions);
             if let Some(err) = &s.failure {
                 return Err(err.clone());
@@ -118,8 +116,7 @@ impl WslAdapter for MockWslAdapter {
                 return Err(WslError::WslNotInstalled);
             }
             Ok(s.distributions.clone())
-        });
-        result
+        })
     }
 
     fn resolve_home(&self, distro: &str) -> Result<PathBuf, WslError> {
@@ -140,7 +137,8 @@ impl WslAdapter for MockWslAdapter {
 
     fn read_file(&self, distro: &str, path: &Path) -> Result<String, WslError> {
         self.with(|s| {
-            s.calls.push(WslCall::ReadFile(distro.to_string(), path.to_path_buf()));
+            s.calls
+                .push(WslCall::ReadFile(distro.to_string(), path.to_path_buf()));
             if let Some(err) = &s.failure {
                 return Err(err.clone());
             }
@@ -178,8 +176,10 @@ impl WslAdapter for MockWslAdapter {
         _env: &[(&str, &str)],
     ) -> Result<CommandOutput, WslError> {
         self.with(|s| {
-            s.calls
-                .push(WslCall::RunCommand(distro.to_string(), args.iter().map(|a| a.to_string()).collect()));
+            s.calls.push(WslCall::RunCommand(
+                distro.to_string(),
+                args.iter().map(|a| a.to_string()).collect(),
+            ));
             if let Some(err) = &s.failure {
                 return Err(err.clone());
             }
@@ -197,6 +197,9 @@ impl WslAdapter for MockWslAdapter {
     fn diagnose(&self, target: Option<&str>) -> Result<WslDiagnostic, WslError> {
         self.with(|s| {
             s.calls.push(WslCall::Diagnose(target.map(str::to_string)));
+            if let Some(err) = &s.failure {
+                return Err(err.clone());
+            }
             if !s.installed {
                 return Ok(WslDiagnostic {
                     state: WslState::WslNotInstalled,
@@ -286,7 +289,9 @@ mod tests {
         mock.set_home("Ubuntu-22.04", PathBuf::from("/home/quorbuser"));
         let home = mock.resolve_home("Ubuntu-22.04").expect("home");
         assert_eq!(home, PathBuf::from("/home/quorbuser"));
-        assert!(mock.calls().contains(&WslCall::ResolveHome("Ubuntu-22.04".into())));
+        assert!(mock
+            .calls()
+            .contains(&WslCall::ResolveHome("Ubuntu-22.04".into())));
         assert!(
             !mock.calls().contains(&WslCall::ListDistributions),
             "resolver home no debe implicar enumerar"
@@ -321,7 +326,9 @@ mod tests {
 
         let mock = mock_with_distros(&["Ubuntu-22.04"]);
         assert_eq!(
-            mock.diagnose(Some("Ubuntu-22.04")).expect("diagnóstico").state,
+            mock.diagnose(Some("Ubuntu-22.04"))
+                .expect("diagnóstico")
+                .state,
             WslState::Available
         );
         assert_eq!(
@@ -366,11 +373,35 @@ mod tests {
     fn missing_file_reports_file_not_found() {
         let mock = mock_with_distros(&["Ubuntu-22.04"]);
         let err = mock
-            .read_file("Ubuntu-22.04", Path::new("/home/quorbuser/.claude/.credentials.json"))
+            .read_file(
+                "Ubuntu-22.04",
+                Path::new("/home/quorbuser/.claude/.credentials.json"),
+            )
             .expect_err("sin fichero");
         assert_eq!(
             err,
             WslError::FileNotFound("/home/quorbuser/.claude/.credentials.json".to_string())
+        );
+    }
+
+    /// `set_failure` también afecta a `diagnose` (M-1): un fallo de sonda
+    /// (timeout, spawn) se propaga antes de evaluar los estados.
+    #[test]
+    fn diagnose_honors_set_failure() {
+        let mock = mock_with_distros(&["Ubuntu-22.04"]);
+        mock.set_failure(WslError::Timeout {
+            distro: "Ubuntu-22.04".to_string(),
+            pid: 7,
+        });
+        let err = mock
+            .diagnose(Some("Ubuntu-22.04"))
+            .expect_err("timeout de sonda");
+        assert_eq!(
+            err,
+            WslError::Timeout {
+                distro: "Ubuntu-22.04".to_string(),
+                pid: 7
+            }
         );
     }
 

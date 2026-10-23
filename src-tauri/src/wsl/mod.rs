@@ -99,9 +99,9 @@ pub trait WslAdapter: Send + Sync {
 /// Distro enumerada (`wsl --list --verbose` bajo WSL_UTF8, F1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Distribution {
-    pub name: String,        // nombre de store o importado
-    pub state: DistroState,  // Running / Stopped
-    pub version: u8,         // 1 o 2
+    pub name: String,       // nombre de store o importado
+    pub state: DistroState, // Running / Stopped
+    pub version: u8,        // 1 o 2
 }
 
 /// Estado de la columna STATE de `wsl --list --verbose`. Incluye los estados
@@ -136,8 +136,8 @@ pub fn distro(name: &str, state: DistroState) -> Distribution {
 /// Estrategia de shell (W1 §3): se detecta una vez y se reutiliza.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellStrategy {
-    BashLogin,   // -e bash -lc  (bash existe; PATH limpio del login)
-    ShPosix,     // -e sh -c     (fallback; Alpine/busybox)
+    BashLogin, // -e bash -lc  (bash existe; PATH limpio del login)
+    ShPosix,   // -e sh -c     (fallback; Alpine/busybox)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,9 +149,9 @@ pub struct WslDiagnostic {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WslState {
-    Available,        // WSL + ≥1 distro
-    WslNotInstalled,  // F6
-    NoDistributions,  // F6
+    Available,         // WSL + ≥1 distro
+    WslNotInstalled,   // F6
+    NoDistributions,   // F6
     DistroUnavailable, // elegida pero no presente (decisión paso 0 #3)
 }
 
@@ -163,10 +163,31 @@ pub enum WslState {
 ///
 /// La existencia del fichero la verifica el proveedor; aquí solo se decide
 /// *qué* path se usa.
-pub fn session_path(explicit: Option<&str>, mode_home: &Path, relative: &Path) -> PathBuf {
+/// Ruta del archivo de credenciales para la precedencia de W1 §5:
+/// `credentials_path` explícito > home del modo activo de la distro.
+///
+/// En modo WSL la ruta explícita DEBE ser absoluta: `read_file` la pasa al
+/// `cat` de la distro, cuyo proceso corre en el directorio de la distro
+/// (F8), no en el home ni en el cwd de Windows — una ruta relativa caería
+/// en un directorio dependiente del estado de la distro. (Decisión
+/// declarada al owner, revisión rust 2026-10-23; Fase B valida que el
+/// impl rechace la relativa como `InvalidArgument`.)
+pub fn session_path(
+    explicit: Option<&str>,
+    mode_home: &Path,
+    relative: &Path,
+) -> Result<PathBuf, WslError> {
     match explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(p) => PathBuf::from(p),
-        None => mode_home.join(relative),
+        Some(p) => {
+            let path = PathBuf::from(p);
+            if !path.is_absolute() {
+                return Err(WslError::InvalidArgument(format!(
+                    "credentials_path en modo WSL debe ser absoluto, se recibió: {p}"
+                )));
+            }
+            Ok(path)
+        }
+        None => Ok(mode_home.join(relative)),
     }
 }
 
@@ -206,7 +227,8 @@ mod tests {
             Some("/mnt/c/Users/quorb/creds.json"),
             &home,
             Path::new(".claude/.credentials.json"),
-        );
+        )
+        .expect("ruta absoluta");
         assert_eq!(explicit, PathBuf::from("/mnt/c/Users/quorb/creds.json"));
     }
 
@@ -215,8 +237,12 @@ mod tests {
     #[test]
     fn without_explicit_path_the_mode_home_is_used() {
         let home = PathBuf::from("/home/quorbuser");
-        let path = session_path(None, &home, Path::new(".claude/.credentials.json"));
-        assert_eq!(path, PathBuf::from("/home/quorbuser/.claude/.credentials.json"));
+        let path = session_path(None, &home, Path::new(".claude/.credentials.json"))
+            .expect("ruta del home");
+        assert_eq!(
+            path,
+            PathBuf::from("/home/quorbuser/.claude/.credentials.json")
+        );
     }
 
     /// W1 §5: un path explícito en blanco se trata como ausente (no como una
@@ -224,8 +250,19 @@ mod tests {
     #[test]
     fn blank_explicit_path_falls_back_to_mode_home() {
         let home = PathBuf::from("/home/quorbuser");
-        let path = session_path(Some("   "), &home, Path::new(".codex/auth.json"));
+        let path =
+            session_path(Some("   "), &home, Path::new(".codex/auth.json")).expect("ruta del home");
         assert_eq!(path, PathBuf::from("/home/quorbuser/.codex/auth.json"));
+    }
+
+    /// M-2: en modo WSL una ruta explícita RELATIVA se rechaza — el `cat` de
+    /// la distro corre en el directorio de la distro (F8), no en el home.
+    #[test]
+    fn relative_explicit_path_is_rejected() {
+        let home = PathBuf::from("/home/quorbuser");
+        let err = session_path(Some("creds.json"), &home, Path::new(".codex/auth.json"))
+            .expect_err("ruta relativa");
+        assert!(matches!(err, WslError::InvalidArgument(_)));
     }
 
     /// W1 §5 completo: precedencia `credentials_path` > home de la distro >
@@ -237,7 +274,8 @@ mod tests {
         mock.set_distributions(vec![distro("Ubuntu-22.04", DistroState::Stopped)]);
         mock.set_home("Ubuntu-22.04", PathBuf::from("/home/quorbuser"));
         let home = mock.resolve_home("Ubuntu-22.04").expect("home");
-        let path = session_path(None, &home, Path::new(".gemini/oauth_creds.json"));
+        let path = session_path(None, &home, Path::new(".gemini/oauth_creds.json"))
+            .expect("ruta del home");
         assert_eq!(
             path,
             PathBuf::from("/home/quorbuser/.gemini/oauth_creds.json")
@@ -296,4 +334,3 @@ mod tests {
         );
     }
 }
-
