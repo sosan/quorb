@@ -197,9 +197,21 @@ impl WslAdapter for RealWslAdapter {
             Ok(output) => Ok(output.stdout),
             // El timeout se propaga: no es un fichero ausente.
             Err(err @ WslError::Timeout { .. }) => Err(err),
-            // Cualquier otro fallo del `cat` es, en la práctica, que el
-            // fichero no está: no hay sesión que leer.
-            Err(_) => Err(WslError::FileNotFound(path_str)),
+            // WSL ausente, distro equivocada o argumento inválido también se
+            // propagan: confundirlos con "fichero ausente" rompería el
+            // diagnóstico (F6/W1 §7). Solo el `cat` fallido sin token
+            // conocido (p. ej. "No such file") es, en la práctica, que el
+            // fichero no está.
+            Err(WslError::WslNotInstalled) => Err(WslError::WslNotInstalled),
+            Err(err @ WslError::DistroNotFound(_)) => Err(err),
+            Err(err @ WslError::InvalidArgument(_)) => Err(err),
+            // `run_scoped` no produce estas variantes (no hay `--list` ni
+            // pidfile en `cat`), pero el match debe ser exhaustivo: si
+            // alguna llega, no se disfraza de "fichero ausente".
+            Err(
+                err @ (WslError::NoDistributions | WslError::FileNotFound(_) | WslError::Spawn(_)),
+            ) => Err(err),
+            Err(WslError::UnparsableOutput(_)) => Err(WslError::FileNotFound(path_str)),
         }
     }
 
@@ -259,7 +271,7 @@ impl WslAdapter for RealWslAdapter {
             Some(name) => {
                 let known = distros
                     .iter()
-                    .any(|d| d.name.eq_ignore_ascii_case(name.trim()));
+                    .any(|d| super::distro_name_matches(name, &d.name));
                 if known {
                     Ok(WslDiagnostic {
                         state: WslState::Available,
@@ -485,6 +497,65 @@ mod tests {
         assert_eq!(diag.state, WslState::DistroUnavailable);
         let detail = diag.detail.expect("detalle");
         assert!(detail.contains("Ubuntu-22.04"));
+    }
+
+    /// M5: el adaptador real acepta un nombre configurado con distinta
+    /// caja (trim + case-insensitive Unicode) — igual que el mock, para
+    /// que ambos sean dobles fieles.
+    #[test]
+    fn diagnose_accepts_different_case_like_the_mock() {
+        let runner = FakeRunner::default();
+        runner.respond("--version", ok("WSL version 2.0\n"));
+        runner.respond(
+            "--list",
+            ok("NAME            STATE           VERSION\nUbuntu-22.04   Running         2\n"),
+        );
+        let adapter = adapter(runner);
+        let diag = adapter.diagnose(Some("ubuntu-22.04")).expect("diagnóstico");
+        assert_eq!(diag.state, WslState::Available);
+    }
+
+    /// H2: un `cat` fallido es "fichero ausente", pero WSL ausente o una
+    /// distro equivocada NO pueden disfrazarse de eso: el diagnóstico
+    /// (F6/W1 §7) depende de distinguirlos.
+    #[test]
+    fn read_file_distinguishes_missing_file_from_missing_wsl() {
+        // WSL ausente: se propaga, no se convierte en FileNotFound.
+        let runner = FakeRunner::default();
+        runner.spawn_on("cat");
+        let adapter = adapter(runner);
+        let err = adapter
+            .read_file(
+                "Ubuntu-22.04",
+                Path::new("/home/u/.claude/.credentials.json"),
+            )
+            .expect_err("WSL ausente");
+        assert_eq!(err, WslError::WslNotInstalled);
+    }
+
+    /// H2: `cat` fallido sin token conocido → el fichero no está.
+    #[test]
+    fn read_file_reports_missing_file_on_failed_cat() {
+        let runner = FakeRunner::default();
+        runner.respond(
+            "cat",
+            CommandOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: "cat: /home/u/.claude/.credentials.json: No such file".into(),
+            },
+        );
+        let adapter = adapter(runner);
+        let err = adapter
+            .read_file(
+                "Ubuntu-22.04",
+                Path::new("/home/u/.claude/.credentials.json"),
+            )
+            .expect_err("fichero ausente");
+        assert_eq!(
+            err,
+            WslError::FileNotFound("/home/u/.claude/.credentials.json".to_string())
+        );
     }
 
     /// `terminate()` es el nivel 2: `--terminate <distro>`, sin el

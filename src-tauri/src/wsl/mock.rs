@@ -101,7 +101,10 @@ impl MockWslAdapter {
 
     /// ¿La distro aparece en la enumeración? (sin contar el fallo forzado).
     fn is_enumerated(state: &MockState, distro: &str) -> bool {
-        state.distributions.iter().any(|d| d.name == distro)
+        state
+            .distributions
+            .iter()
+            .any(|d| super::distro_name_matches(distro, &d.name))
     }
 }
 
@@ -327,6 +330,13 @@ mod tests {
         let mock = mock_with_distros(&["Ubuntu-22.04"]);
         assert_eq!(
             mock.diagnose(Some("Ubuntu-22.04"))
+                .expect("diagnóstico")
+                .state,
+            WslState::Available
+        );
+        // M5: misma regla que el adaptador real — case-insensitive Unicode.
+        assert_eq!(
+            mock.diagnose(Some("ubuntu-22.04"))
                 .expect("diagnóstico")
                 .state,
             WslState::Available

@@ -191,8 +191,28 @@ pub fn session_path(
             }
             Ok(path)
         }
-        None => Ok(mode_home.join(relative)),
+        None => {
+            // La ruta relativa al proveedor también debe ser relativa: si
+            // fuera absoluta, `join` la dejaría escapar del home del modo.
+            if relative.is_absolute() {
+                return Err(WslError::InvalidArgument(format!(
+                    "la ruta del proveedor dentro del modo debe ser relativa, se recibió: {}",
+                    relative.display()
+                )));
+            }
+            Ok(mode_home.join(relative))
+        }
     }
+}
+
+/// ¿Coincide el nombre configurado con el de una distro enumerada?
+///
+/// Comparación normalizada: trim + case-insensitive **Unicode** (no solo
+/// ASCII: un nombre de distro puede llevar acentos). Es la ÚNICA regla de
+/// matching del módulo — la usan el mock, el adaptador real y
+/// `resolve_distro_name`, para que el mock sea un doble fiel del real.
+pub fn distro_name_matches(configured: &str, actual: &str) -> bool {
+    configured.trim().to_lowercase() == actual.trim().to_lowercase()
 }
 
 /// Resuelve el nombre de distro configurado contra la enumeración real (F4).
@@ -207,13 +227,12 @@ pub fn session_path(
 /// conserva el valor configurado y reporta `DistroUnavailable` (decisión
 /// paso 0 #3, sin fallback a native).
 pub fn resolve_distro_name(configured: &str, enumerated: &[Distribution]) -> Option<String> {
-    let wanted = configured.trim().to_lowercase();
-    if wanted.is_empty() {
+    if configured.trim().is_empty() {
         return None;
     }
     enumerated
         .iter()
-        .find(|d| d.name.trim().to_lowercase() == wanted)
+        .find(|d| distro_name_matches(configured, &d.name))
         .map(|d| d.name.clone())
 }
 
@@ -266,6 +285,16 @@ mod tests {
         let home = PathBuf::from("/home/quorbuser");
         let err = session_path(Some("creds.json"), &home, Path::new(".codex/auth.json"))
             .expect_err("ruta relativa");
+        assert!(matches!(err, WslError::InvalidArgument(_)));
+    }
+
+    /// M6: la ruta relativa al proveedor también debe ser relativa — un
+    /// path absoluto escaparía del home del modo por `join`.
+    #[test]
+    fn absolute_provider_relative_is_rejected() {
+        let home = PathBuf::from("/home/quorbuser");
+        let err = session_path(None, &home, Path::new("/etc/passwd"))
+            .expect_err("ruta absoluta del proveedor");
         assert!(matches!(err, WslError::InvalidArgument(_)));
     }
 

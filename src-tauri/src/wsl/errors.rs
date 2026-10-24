@@ -26,15 +26,12 @@ pub fn looks_utf16(raw: &str) -> bool {
     if chars.len() < 4 {
         return false;
     }
-    // En UTF-16LE los bytes ASCII van en las posiciones impares, así que el
-    // texto alterna carácter + NUL.
-    let odd_nuls = chars
-        .iter()
-        .skip(1)
-        .step_by(2)
-        .filter(|c| **c == '\0')
-        .count();
-    odd_nuls > 0 && odd_nuls * 4 >= chars.len()
+    // En UTF-16LE cada carácter ASCII va seguido de su NUL, así que la
+    // salida llega con NUL intercalados. Se mide la DENSIDAD de NUL en vez
+    // de la paridad: con no-ASCII (p. ej. cirílico) los bytes ya no caen en
+    // posiciones alternas, y un texto UTF-8 legítimo no contiene NUL.
+    let nuls = chars.iter().filter(|c| **c == '\0').count();
+    nuls > 0 && nuls * 3 >= chars.len()
 }
 
 /// Clasifica la salida de un comando fallido de `wsl.exe`.
@@ -66,6 +63,13 @@ pub fn classify(output: &CommandOutput, distro: Option<&str>) -> Option<WslError
             "wsl.exe rechazó los argumentos (Invalid command line argument)".into(),
         ));
     }
+    // `wsl.exe` existe (p. ej. en una imagen de Windows sin el subsistema
+    // habilitado) pero el propio WSL no está disponible: `--version` sale
+    // con "Windows Subsystem for Linux is not installed". Es el mismo
+    // estado que el spawn fallido (F6).
+    if lower.contains("is not installed") || lower.contains("not enabled") {
+        return Some(WslError::WslNotInstalled);
+    }
     None
 }
 
@@ -75,6 +79,10 @@ pub fn classify(output: &CommandOutput, distro: Option<&str>) -> Option<WslError
 /// `NAME STATE VERSION` al principio. El nombre va por delante del
 /// estado y la versión, así que se separa desde la derecha: un nombre con
 /// espacios se conserva entero.
+///
+/// La distro por defecto lleva un `*` delante (evidencia F12 del lab:
+/// `* quorb_w0`); se quita del nombre, que no puede empezar por `*`
+/// (los nombres válidos de F3 no lo permiten).
 ///
 /// Se ignoran las líneas que no encajan (cabecera, notas al pie, avisos):
 /// solo cuentan las que terminan en un estado conocido y una versión.
@@ -98,11 +106,13 @@ pub fn parse_list_verbose(raw: &str) -> Vec<Distribution> {
         let Ok(version) = version.parse::<u8>() else {
             continue;
         };
+        // `wsl --list --verbose` marca la distro por defecto con `*`.
+        let name = name.strip_prefix('*').map(str::trim).unwrap_or(&name);
         if name.is_empty() {
             continue;
         }
         out.push(Distribution {
-            name,
+            name: name.to_string(),
             state,
             version,
         });
@@ -225,6 +235,41 @@ WSL2 is not installed with this build.
         assert!(looks_utf16("U\0b\0u\0n\0t\0u\0"));
         assert!(!looks_utf16("Ubuntu-22.04\nDebian\n"));
         assert!(!looks_utf16(""));
+    }
+
+    /// F1 con no-ASCII: los bytes ya no caen en posiciones alternas, pero
+    /// la densidad de NUL sigue delatando el UTF-16 (si no, se parsearía
+    /// basura en vez de reportar el error accionable).
+    #[test]
+    fn detects_utf16_with_non_ascii_names() {
+        // "Quorb-Проверка" en UTF-16LE pasa por el runner de texto como
+        // caracteres alternos con NUL.
+        let raw: String = "Quorb-Проверка".chars().flat_map(|c| [c, '\0']).collect();
+        assert!(looks_utf16(&raw));
+    }
+
+    /// `wsl --list --verbose` marca la distro por defecto con `*` (F12):
+    /// el nombre debe quedar limpio, si no la distro más común parece
+    /// ausente.
+    #[test]
+    fn strips_the_default_distro_marker() {
+        let raw = "NAME            STATE           VERSION\n* quorb_w0      Stopped         2\nDebian          Running         2\n";
+        let distros = parse_list_verbose(raw);
+        assert_eq!(distros.len(), 2);
+        assert_eq!(distros[0].name, "quorb_w0");
+        assert_eq!(distros[1].name, "Debian");
+    }
+
+    /// F6: `wsl.exe` presente pero con el subsistema no habilitado es el
+    /// mismo estado que el binario ausente.
+    #[test]
+    fn classifies_wsl_not_installed_token() {
+        let out = CommandOutput {
+            code: -1,
+            stdout: String::new(),
+            stderr: "Windows Subsystem for Linux is not installed.".into(),
+        };
+        assert_eq!(classify(&out, None), Some(WslError::WslNotInstalled));
     }
 
     /// El home es el campo 6 de `getent passwd`.
