@@ -374,14 +374,6 @@ mod tests {
         RealWslAdapter::with_runner_and_program(Box::new(runner), PathBuf::from("wsl.exe"))
     }
 
-    /// Registra una respuesta y devuelve el runner para poder consultar
-    /// después las llamadas registradas.
-    fn runner_with(needle: &str, output: CommandOutput) -> FakeRunner {
-        let runner = FakeRunner::default();
-        runner.respond(needle, output);
-        runner
-    }
-
     /// La enumeración usa `--list --verbose` y NO despierta (F4): el argv
     /// no lleva `-d`.
     #[test]
