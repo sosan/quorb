@@ -94,10 +94,22 @@ impl RealWslAdapter {
     }
 
     /// Fusiona las variables de sesión del llamador en el env del hijo.
+    ///
+    /// Las de valor de ruta se anuncian también en `WSLENV` con `/p`
+    /// (traducción de path Windows→Linux por el propio WSL): sin eso, una
+    /// var como `CODEX_HOME=C:\Users\...` llegaría a la distro sin traducir
+    /// y el comando no encontraría las rutas (contrato W1 §5/§7).
     fn env_with(&self, extra: &[(&str, &str)]) -> BTreeMap<String, String> {
         let mut env = self.env.clone();
+        let mut wslenv = env.get("WSLENV").cloned().unwrap_or_default();
         for (k, v) in extra {
             env.insert((*k).to_string(), (*v).to_string());
+            if let Some(marked) = build_wslenv_entry(k, v, &wslenv) {
+                wslenv = marked;
+            }
+        }
+        if !wslenv.is_empty() {
+            env.insert("WSLENV".to_string(), wslenv);
         }
         env
     }
@@ -138,6 +150,40 @@ impl RealWslAdapter {
         let cwd = Self::cwd();
         self.runner(&merged, &cwd).run_scoped(distro, shell, args)
     }
+}
+
+/// Construye la entrada de `WSLENV` para una variable extra.
+///
+/// Una variable cuyo valor es un path de Windows (`C:\...` o `\\share\...`)
+/// se marca con `/p` para que WSL traduzca el path al anclar la variable en
+/// la distro. Sin la marca, el valor llega textual y las rutas no apuntan a
+/// donde el comando las espera (contrato W1 §5/§7).
+///
+/// Devuelve el `WSLENV` ampliado. Acepta el valor acumulado actual (por si
+/// el llamador ya pasó un `WSLENV` explícito) para no pisarlo.
+fn build_wslenv_entry(key: &str, value: &str, current: &str) -> Option<String> {
+    let is_windows_path = value.starts_with("\\\\")
+        || value
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+            && value.as_bytes().get(1) == Some(&b':');
+    if !is_windows_path {
+        return None;
+    }
+    let entry = format!("{key}/p");
+    // No duplicar entradas ya presentes (con o sin flags).
+    let already = current
+        .split(':')
+        .any(|token| token.split('/').next() == Some(key));
+    if already {
+        return None;
+    }
+    Some(if current.is_empty() {
+        entry
+    } else {
+        format!("{current}:{entry}")
+    })
 }
 
 impl Default for RealWslAdapter {
@@ -555,6 +601,50 @@ mod tests {
         assert_eq!(
             err,
             WslError::FileNotFound("/home/u/.claude/.credentials.json".to_string())
+        );
+    }
+
+    /// Las vars con valor de path de Windows se marcan en WSLENV con `/p`
+    /// para que WSL traduzca el path al anclar la variable en la distro.
+    #[test]
+    fn wslenv_marks_windows_paths() {
+        assert_eq!(
+            build_wslenv_entry("CODEX_HOME", r"C:\Users\quorb\.codex", "").as_deref(),
+            Some("CODEX_HOME/p")
+        );
+        assert_eq!(
+            build_wslenv_entry(
+                "CLAUDE_CONFIG_DIR",
+                r"\\wsl.localhost\Ubuntu\home\q\.claude",
+                ""
+            )
+            .as_deref(),
+            Some("CLAUDE_CONFIG_DIR/p")
+        );
+        // Acumula respetando lo que ya había.
+        assert_eq!(
+            build_wslenv_entry("CODEX_HOME", r"C:\a", "GEMINI_CLI_HOME/p").as_deref(),
+            Some("GEMINI_CLI_HOME/p:CODEX_HOME/p")
+        );
+    }
+
+    /// Un valor que no es path de Windows no se toca: llega tal cual.
+    #[test]
+    fn wslenv_leaves_non_paths_alone() {
+        assert_eq!(build_wslenv_entry("DEBUG", "1", ""), None);
+        assert_eq!(build_wslenv_entry("WSLENV_PATH", "/home/x", ""), None);
+    }
+
+    /// No duplica una entrada ya presente (con o sin flag).
+    #[test]
+    fn wslenv_does_not_duplicate() {
+        assert_eq!(
+            build_wslenv_entry("CODEX_HOME", r"C:\a", "CODEX_HOME"),
+            None
+        );
+        assert_eq!(
+            build_wslenv_entry("CODEX_HOME", r"C:\a", "CODEX_HOME/p"),
+            None
         );
     }
 

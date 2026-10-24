@@ -24,30 +24,52 @@ use std::time::Duration;
 /// interpolar nada. `$0` es el nombre de cortesía; `$@` son los datos.
 pub const SCRIPT_EXEC: &str = "exec \"$@\"";
 
-/// Script constante con pidfile: escribe el PID del shell en `$1` y
-/// ejecuta el resto. Como `exec` conserva el PID, ese es el proceso que
-/// se mata en la cancelación acotada (nivel 1).
-pub const SCRIPT_EXEC_PIDFILE: &str = "echo $$ > \"$1\"; shift; exec \"$@\"";
+/// Script constante con pidfile: crea un DIRECTORIO privado (700) en la
+/// distro, escribe el PID del shell en `pid` y ejecuta el resto. Como
+/// `exec` conserva el PID, ese es el proceso que se mata en la cancelación
+/// acotada (nivel 1).
+///
+/// El directorio (pasado como `$1`) tiene nombre impredecible y se crea con
+/// `mkdir` a secas (falla si ya existe): otro usuario de la distro no puede
+/// pre-crear un symlink ni un dir con el mismo nombre, y el `chmod 700`
+/// deja el contenido solo visible para el dueño. `umask 077` hace el
+/// `pid` legible solo por el usuario.
+pub const SCRIPT_EXEC_PIDFILE: &str =
+    "mkdir \"$1\" && chmod 700 \"$1\" && umask 077 && echo $$ > \"$1/pid\" && shift && exec \"$@\"";
 
 /// Nombre de cortesía para `$0`. No es un dato: solo ocupa la posición.
 const SHELL_ARGV0: &str = "quorb";
 
-/// Nonce único por operación, para que dos pidfiles no se pisen.
+/// Contador de operaciones, para que el nonce sea distinto entre llamadas.
 static NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn next_nonce() -> u64 {
     NONCE.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Ruta del pidfile **dentro de la distro**. `/tmp` es escribible por el
-/// usuario en cualquier distro y no depende de conocer el home (que es
-/// justo lo que se está resolviendo).
-pub fn pidfile_path() -> PathBuf {
+/// Nombre del directorio del pidfile **dentro de la distro**, impredecible.
+///
+/// `/tmp` es escribible por el usuario en cualquier distro y no depende de
+/// conocer el home (que es justo lo que se está resolviendo). El nonce
+/// combina el PID del proceso, un contador y el reloj de nanos: suficiente
+/// para que otro usuario de la distro no pueda pre-crear el directorio.
+/// No es criptográfico: el adversario real aquí es un usuario local de la
+/// distro sin acceso al timestamp de alta resolución del proceso.
+pub fn pidfile_dir() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     PathBuf::from(format!(
-        "/tmp/quorb-wsl-{}-{}.pid",
+        "/tmp/quorb-wsl-{}-{}-{nanos}",
         std::process::id(),
         next_nonce()
     ))
+}
+
+/// Ruta del `pid` dentro del directorio de la operación.
+pub fn pidfile_path(dir: &Path) -> PathBuf {
+    dir.join("pid")
 }
 
 /// Rutas donde puede vivir `wsl.exe` (F9).
@@ -284,12 +306,12 @@ impl<'a> WslRunner<'a> {
         shell: ShellStrategy,
         args: &[&str],
     ) -> Result<CommandOutput, WslError> {
-        let pidfile = pidfile_path();
-        let pidfile_str = pidfile.to_string_lossy().to_string();
+        let pid_dir = pidfile_dir();
+        let pid_dir_str = pid_dir.to_string_lossy().to_string();
 
-        // El pidfile ocupa `$1`; el comando va detrás.
+        // El directorio de la operación ocupa `$1`; el comando va detrás.
         let mut shell_args_all: Vec<&str> = Vec::with_capacity(args.len() + 1);
-        shell_args_all.push(pidfile_str.as_str());
+        shell_args_all.push(pid_dir_str.as_str());
         shell_args_all.extend_from_slice(args);
 
         let argv = shell_args(Some(distro), shell, SCRIPT_EXEC_PIDFILE, &shell_args_all);
@@ -312,7 +334,7 @@ impl<'a> WslRunner<'a> {
                     self.runner,
                     self.program,
                     distro,
-                    &pidfile,
+                    &pid_dir,
                     self.env,
                     self.cwd,
                     self.cleanup_timeout,
@@ -330,6 +352,10 @@ impl<'a> WslRunner<'a> {
     }
 }
 
+/// Gracia que se le da al remoto entre el `kill -TERM` y el `-KILL`.
+const TERM_GRACE: Duration = Duration::from_millis(100);
+const TERM_PROBES: usize = 10;
+
 /// Lee el PID del pidfile y mata ese proceso dentro de la distro.
 ///
 /// Devuelve el PID si se pudo leer y matar; 0 si no se pudo determinar
@@ -338,11 +364,12 @@ fn kill_remote_process(
     runner: &dyn CommandRunner,
     program: &Path,
     distro: &str,
-    pidfile: &Path,
+    pid_dir: &Path,
     env: &BTreeMap<String, String>,
     cwd: &Path,
     cleanup_timeout: Duration,
 ) -> i64 {
+    let pidfile = pidfile_path(pid_dir);
     let pidfile_str = pidfile.to_string_lossy().to_string();
     let read = direct_args(Some(distro), "cat", &[pidfile_str.as_str()]);
     let pid = runner
@@ -357,7 +384,23 @@ fn kill_remote_process(
         // `kill` con el PID como argv: sin shell, sin interpolación.
         let term = direct_args(Some(distro), "kill", &["-TERM", pid_str.as_str()]);
         let _ = runner.run(program, &term, env, cwd, cleanup_timeout);
-        // Si sigue vivo tras el TERM, KILL.
+        // Gracia: el TERM es la vía suave; solo si al cabo de esas sondas
+        // sigue vivo se escala a KILL (antes el -KILL era instantáneo y la
+        // vía suave nunca se ejercitaba).
+        for _ in 0..TERM_PROBES {
+            let alive = direct_args(Some(distro), "kill", &["-0", pid_str.as_str()]);
+            let alive = match runner.run(program, &alive, env, cwd, cleanup_timeout) {
+                Ok(out) => out.code == 0,
+                // Comandos de limpieza acotados; un fallo aquí es indicio
+                // de que el pid ya no está: se trata como "murió".
+                Err(_) => false,
+            };
+            if !alive {
+                break;
+            }
+            std::thread::sleep(TERM_GRACE);
+        }
+        // Segunda comprobación tras la gracia; si sigue, KILL.
         let alive = direct_args(Some(distro), "kill", &["-0", pid_str.as_str()]);
         if let Ok(out) = runner.run(program, &alive, env, cwd, cleanup_timeout) {
             if out.code == 0 {
@@ -367,8 +410,9 @@ fn kill_remote_process(
         }
     }
 
-    // El pidfile no se deja en la distro.
-    let rm = direct_args(Some(distro), "rm", &["-f", pidfile_str.as_str()]);
+    // El directorio de la operación no se deja en la distro.
+    let pid_dir_str = pid_dir.to_string_lossy().to_string();
+    let rm = direct_args(Some(distro), "rm", &["-rf", pid_dir_str.as_str()]);
     let _ = runner.run(program, &rm, env, cwd, cleanup_timeout);
     pid
 }
@@ -501,11 +545,27 @@ mod tests {
     /// Dos operaciones no comparten pidfile.
     #[test]
     fn pidfiles_are_unique() {
-        let a = pidfile_path();
-        let b = pidfile_path();
+        let a = pidfile_dir();
+        let b = pidfile_dir();
         assert_ne!(a, b);
         assert!(a.to_string_lossy().starts_with("/tmp/quorb-wsl-"));
-        assert!(a.to_string_lossy().ends_with(".pid"));
+        // El pid vive dentro del directorio privado de la operación.
+        assert_eq!(pidfile_path(&a), a.join("pid"));
+    }
+
+    /// El directorio del pidfile no debe ser predecible: lleva el reloj de
+    /// nanos, no solo un contador.
+    #[test]
+    fn pidfile_dir_is_not_just_a_counter() {
+        let dir = pidfile_dir().to_string_lossy().to_string();
+        let parts: Vec<&str> = dir
+            .trim_start_matches("/tmp/quorb-wsl-")
+            .split('-')
+            .collect();
+        assert!(
+            parts.len() >= 3 && parts[2].parse::<u128>().is_ok(),
+            "el nombre debe incluir un nonce temporal: {dir}"
+        );
     }
 
     /// Nivel 1: si el comando expira, se mata el proceso remoto de la
