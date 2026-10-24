@@ -10,7 +10,7 @@
 //!   Rust (nunca `| cut`).
 //! - **Enumeración**: `wsl --list --verbose`, que NO despierta la distro
 //!   (F4).
-//! - **Diagnóstico**: `--status` (WSL ausente) y `--list` (cero distros).
+//! - **Diagnóstico**: `--version` (WSL ausente) y `--list` (cero distros).
 //!   como sondas separadas (F6).
 //! - **Timeout**: cancelación ACOTADA (nivel 1) — se mata el proceso
 //!   remoto de la operación y la distro queda `Running`.
@@ -291,22 +291,28 @@ impl WslAdapter for RealWslAdapter {
         self.in_distro(distro, shell, args, env)
     }
 
-    /// F6: sondas separadas — `--status` (WSL ausente) y `--list` (cero
+    /// F6: sondas separadas — `--version` (WSL ausente) y `--list` (cero
     /// distros o distro objetivo ausente).
     ///
-    /// La sonda de WSL es `--status` y no `--version`: el `wsl.exe` de
-    /// Windows Server 2022 no conoce `--version` (devuelve "Invalid
-    /// command line argument", que `classify` leería como
-    /// `InvalidArgument` en vez de "WSL ausente"). `--status` existe en
-    /// todas las builds.
+    /// La sonda es `--version` (contrato W1 §6). Un `wsl.exe` de build
+    /// antigua que lo rechaza con "Invalid command line argument" (p. ej.
+    /// Windows Server 2022, hallazgo del lab W3) tampoco tiene WSL2, así
+    /// que se trata como WSL ausente.
     fn diagnose(&self, target: Option<&str>) -> Result<WslDiagnostic, WslError> {
-        let status = option_args("--status", None);
-        match self.control(&status, None) {
+        let version = option_args("--version", None);
+        match self.control(&version, None) {
             Ok(_) => {}
             Err(WslError::WslNotInstalled) => {
                 return Ok(WslDiagnostic {
                     state: WslState::WslNotInstalled,
                     detail: None,
+                })
+            }
+            // Build antigua sin `--version`: sin WSL2 usable.
+            Err(WslError::InvalidArgument(_)) => {
+                return Ok(WslDiagnostic {
+                    state: WslState::WslNotInstalled,
+                    detail: Some("wsl.exe no soporta --version (build antigua, sin WSL2)".into()),
                 })
             }
             Err(e) => return Err(e),
@@ -513,7 +519,7 @@ mod tests {
     #[test]
     fn diagnose_reports_wsl_not_installed() {
         let runner = FakeRunner::default();
-        runner.spawn_on("--status");
+        runner.spawn_on("--version");
         let adapter = adapter(runner);
         assert_eq!(
             adapter.diagnose(None).expect("diagnóstico").state,
@@ -525,7 +531,7 @@ mod tests {
     #[test]
     fn diagnose_reports_no_distributions() {
         let runner = FakeRunner::default();
-        runner.respond("--status", ok("Default Distribution: Ubuntu\n"));
+        runner.respond("--version", ok("WSL version: 2.0.0\n"));
         runner.respond("--list", ok("NAME STATE VERSION\n"));
         let adapter = adapter(runner);
         assert_eq!(
@@ -539,7 +545,7 @@ mod tests {
     #[test]
     fn diagnose_reports_distro_unavailable() {
         let runner = FakeRunner::default();
-        runner.respond("--status", ok("Default Distribution: Ubuntu\n"));
+        runner.respond("--version", ok("WSL version: 2.0.0\n"));
         runner.respond(
             "--list",
             ok("NAME            STATE           VERSION\nUbuntu-22.04   Running         2\n"),
@@ -557,7 +563,7 @@ mod tests {
     #[test]
     fn diagnose_accepts_different_case_like_the_mock() {
         let runner = FakeRunner::default();
-        runner.respond("--status", ok("Default Distribution: Ubuntu\n"));
+        runner.respond("--version", ok("WSL version: 2.0.0\n"));
         runner.respond(
             "--list",
             ok("NAME            STATE           VERSION\nUbuntu-22.04   Running         2\n"),
@@ -654,26 +660,8 @@ mod tests {
         );
     }
 
-    /// La sonda de "WSL ausente" es `--status`, no `--version`: el
-    /// `wsl.exe` de Windows Server 2022 no conoce `--version` (hallazgo
-    /// del lab W3) y devolvería `InvalidArgument` en vez de
-    /// `WslNotInstalled`.
-    #[test]
-    fn diagnose_probes_wsl_with_status_not_version() {
-        let runner = FakeRunner::default();
-        runner.respond("--status", ok("Default Distribution: Ubuntu\n"));
-        let adapter = adapter(runner.clone());
-        adapter.diagnose(None).expect("diagnóstico");
-        let calls = runner.calls();
-        assert!(
-            calls.iter().any(|c| c.contains(&"--status".to_string())),
-            "debe sondear con --status"
-        );
-        assert!(
-            !calls.iter().any(|c| c.contains(&"--version".to_string())),
-            "--version no existe en el wsl.exe de Server 2022"
-        );
-    }
+    /// La sonda de WSL es `--version` (contrato W1 §6); la build antigua
+    /// sin soporte se cubre en `diagnose_maps_old_build_without_version_*`.
 
     /// `terminate()` es el nivel 2: `--terminate <distro>`, sin el
     /// separador `--` (es una opción de `wsl.exe`, no un comando).
