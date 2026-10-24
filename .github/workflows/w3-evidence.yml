@@ -159,6 +159,9 @@ jobs:
             $tag = $d -replace '[^A-Za-z0-9]', ''
             $cases = @(
               @{ name = "space";     value = "con espacio" },
+              # `acentu-ñ-世界` es deliberado: incluye acento, ñ y CJK en un
+              # solo valor "mal escrito" que la doble frontera NO debe
+              # corregir ni transformar — debe llegar byte a byte tal cual.
               @{ name = "nonascii";  value = "acentu-ñ-世界" },
               @{ name = "squote";    value = "it's" },
               @{ name = "dquote";    value = 'say "hi"' },
