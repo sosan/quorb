@@ -9,8 +9,12 @@
 use crate::cli_process::{CommandOutput, RunError};
 use std::path::{Path, PathBuf};
 
+mod errors;
 mod mock;
+mod process;
+mod real;
 pub use mock::{MockWslAdapter, WslCall};
+pub use real::RealWslAdapter;
 
 /// Error tipado de una operación WSL. Se asigna desde el parseo de tokens
 /// del output (F2) o desde fallos del lanzador (F13/timeout).
