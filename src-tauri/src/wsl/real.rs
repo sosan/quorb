@@ -152,33 +152,63 @@ impl RealWslAdapter {
     }
 }
 
-/// Construye la entrada de `WSLENV` para una variable extra.
+/// Variables de sesión que el adaptador puede transmitir a la distro.
 ///
-/// Una variable cuyo valor es un path de Windows (`C:\...` o `\\share\...`)
-/// se marca con `/p` para que WSL traduzca el path al anclar la variable en
-/// la distro. Sin la marca, el valor llega textual y las rutas no apuntan a
-/// donde el comando las espera (contrato W1 §5/§7).
+/// Allowlist explícita: nada de reenviar el entorno del host. Cualquier
+/// variable fuera de esta lista se ignora (sin fallback silencioso: si el
+/// proveedor no la recibe, tampoco se inventa un home alternativo).
+pub const SESSION_ENV_ALLOWLIST: [&str; 3] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME"];
+
+/// ¿El valor es una ruta de Windows (necesita conversión con `/p`)?
 ///
-/// Devuelve el `WSLENV` ampliado. Acepta el valor acumulado actual (por si
-/// el llamador ya pasó un `WSLENV` explícito) para no pisarlo.
+/// Solo esos valores se marcan: una ruta Linux ya resuelta para la distro
+/// NO debe convertirse (se transmitiría mal). Un valor que no es ruta
+/// (p. ej. `debug=1`) no entra en `WSLENV` en absoluto.
+fn is_windows_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with("\\\\")
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+/// ¿El valor es una ruta Linux ya resuelta para la distro?
+fn is_linux_path(value: &str) -> bool {
+    value.starts_with('/')
+}
+
+/// Construye la entrada de `WSLENV` para una variable de sesión.
+///
+/// - Ruta de Windows → `KEY/p` (WSL traduce el path al anclar la variable).
+/// - Ruta Linux ya resuelta → `KEY` sin flag: no hay nada que convertir y
+///   la marca `/p` la estropearía.
+/// - Valor que no es ruta → `None`: no hace falta `WSLENV` (viaja en el
+///   entorno del proceso).
+///
+/// Preserva las entradas ya presentes (con o sin flags) y no duplica.
+/// Devuelve el `WSLENV` ampliado.
 fn build_wslenv_entry(key: &str, value: &str, current: &str) -> Option<String> {
-    let is_windows_path = value.starts_with("\\\\")
-        || value
-            .as_bytes()
-            .first()
-            .is_some_and(|b| b.is_ascii_alphabetic())
-            && value.as_bytes().get(1) == Some(&b':');
-    if !is_windows_path {
+    if !SESSION_ENV_ALLOWLIST.contains(&key) {
         return None;
     }
-    let entry = format!("{key}/p");
-    // No duplicar entradas ya presentes (con o sin flags).
+    let flag = if is_windows_path(value) {
+        Some("/p")
+    } else if is_linux_path(value) {
+        None
+    } else {
+        // No es una ruta: no entra en WSLENV.
+        return None;
+    };
+    // No duplicar: cualquier entrada previa con el mismo nombre (con o sin
+    // flags) se respeta tal cual.
     let already = current
         .split(':')
         .any(|token| token.split('/').next() == Some(key));
     if already {
         return None;
     }
+    let entry = match flag {
+        Some(f) => format!("{key}{f}"),
+        None => key.to_string(),
+    };
     Some(if current.is_empty() {
         entry
     } else {
@@ -640,11 +670,33 @@ mod tests {
         );
     }
 
-    /// Un valor que no es path de Windows no se toca: llega tal cual.
+    /// Una ruta Linux YA resuelta para la distro no se convierte: entra sin
+    /// `/p` (marcarla la estropearía). Un valor que no es ruta no entra.
     #[test]
-    fn wslenv_leaves_non_paths_alone() {
+    fn wslenv_does_not_convert_linux_paths_nor_non_paths() {
+        assert_eq!(
+            build_wslenv_entry("CLAUDE_CONFIG_DIR", "/home/q/.claude", "").as_deref(),
+            Some("CLAUDE_CONFIG_DIR")
+        );
         assert_eq!(build_wslenv_entry("DEBUG", "1", ""), None);
-        assert_eq!(build_wslenv_entry("WSLENV_PATH", "/home/x", ""), None);
+        // Fuera de la allowlist: no se reenvía nada.
+        assert_eq!(build_wslenv_entry("PATH", "/usr/bin", ""), None);
+        assert_eq!(build_wslenv_entry("HOME", r"C:\Users\q", ""), None);
+    }
+
+    /// Solo se transmiten las variables de la allowlist de sesión.
+    #[test]
+    fn wslenv_only_forwards_allowlisted_session_vars() {
+        for key in SESSION_ENV_ALLOWLIST {
+            assert!(
+                build_wslenv_entry(key, r"C:\x", "").is_some(),
+                "{key} debería transmitirse"
+            );
+        }
+        assert_eq!(
+            build_wslenv_entry("AWS_SECRET_ACCESS_KEY", r"C:\x", ""),
+            None
+        );
     }
 
     /// No duplica una entrada ya presente (con o sin flag).

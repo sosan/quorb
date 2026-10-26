@@ -24,18 +24,26 @@ use std::time::Duration;
 /// interpolar nada. `$0` es el nombre de cortesía; `$@` son los datos.
 pub const SCRIPT_EXEC: &str = "exec \"$@\"";
 
-/// Script constante con pidfile: crea un DIRECTORIO privado (700) en la
-/// distro, escribe el PID del shell en `pid` y ejecuta el resto. Como
-/// `exec` conserva el PID, ese es el proceso que se mata en la cancelación
-/// acotada (nivel 1).
+/// Script constante con pidfile endurecido.
 ///
-/// El directorio (pasado como `$1`) tiene nombre impredecible y se crea con
-/// `mkdir` a secas (falla si ya existe): otro usuario de la distro no puede
-/// pre-crear un symlink ni un dir con el mismo nombre, y el `chmod 700`
-/// deja el contenido solo visible para el dueño. `umask 077` hace el
-/// `pid` legible solo por el usuario.
-pub const SCRIPT_EXEC_PIDFILE: &str =
-    "mkdir \"$1\" && chmod 700 \"$1\" && umask 077 && echo $$ > \"$1/pid\" && shift && exec \"$@\"";
+/// `$1` es un DIRECTORIO BASE que crea este script de forma atómica con
+/// `mkdir -m 700` (falla con EEXIST si ya existe: no sigue enlaces
+/// preexistentes, así que otro usuario de la distro no puede plantar un
+/// symlink). Dentro del base se crea el directorio de la operación con
+/// `mktemp -d` (O_EXCL, sufijo aleatorio): el PID vive en
+/// `<base>/<aleatorio>/pid`, solo legible por el dueño (`umask 077`).
+///
+/// `exec` conserva el PID, así que el pidfile apunta al proceso final de la
+/// operación. La limpieza del base (`rm -rf`) la hace el host en éxito,
+/// error y cancelación.
+pub const SCRIPT_EXEC_PIDFILE: &str = concat!(
+    "b=\"$1\" && shift && ",
+    "mkdir -m 700 \"$b\" && ",
+    "d=$(mktemp -d \"$b/XXXXXX\") && ",
+    "umask 077 && ",
+    "echo $$ > \"$d/pid\" && ",
+    "exec \"$@\""
+);
 
 /// Nombre de cortesía para `$0`. No es un dato: solo ocupa la posición.
 const SHELL_ARGV0: &str = "quorb";
@@ -47,15 +55,14 @@ fn next_nonce() -> u64 {
     NONCE.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Nombre del directorio del pidfile **dentro de la distro**, impredecible.
+/// Directorio BASE de la operación **dentro de la distro**.
 ///
 /// `/tmp` es escribible por el usuario en cualquier distro y no depende de
-/// conocer el home (que es justo lo que se está resolviendo). El nonce
-/// combina el PID del proceso, un contador y el reloj de nanos: suficiente
-/// para que otro usuario de la distro no pueda pre-crear el directorio.
-/// No es criptográfico: el adversario real aquí es un usuario local de la
-/// distro sin acceso al timestamp de alta resolución del proceso.
-pub fn pidfile_dir() -> PathBuf {
+/// conocer el home. El nombre combina PID del host, un contador y el reloj
+/// de nanos. Lo crea el script con `mkdir -m 700` (atómico: falla si ya
+/// existe, así que no sigue un symlink plantado) y dentro `mktemp -d`
+/// decide el directorio real de la operación.
+pub fn pidfile_base() -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -67,10 +74,16 @@ pub fn pidfile_dir() -> PathBuf {
     ))
 }
 
-/// Ruta del `pid` dentro del directorio de la operación.
-pub fn pidfile_path(dir: &Path) -> PathBuf {
-    dir.join("pid")
-}
+/// Script constante para leer el PID publicado dentro del base.
+///
+/// El nombre del subdirectorio lo decide `mktemp -d` en la distro, así que
+/// el host lo descubre con un glob dentro del base. `$1` entra como
+/// parámetro posicional: nada se interpola en el script.
+pub const SCRIPT_READ_PID: &str = "cat \"$1\"/*/pid";
+
+/// Script constante para borrar el base de la operación (éxito, error o
+/// cancelación).
+pub const SCRIPT_CLEANUP: &str = "rm -rf \"$1\"";
 
 /// Rutas donde puede vivir `wsl.exe` (F9).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -186,6 +199,29 @@ pub fn direct_args(distro: Option<&str>, command: &str, args: &[&str]) -> Vec<St
     out.push(command.to_string());
     out.extend(args.iter().map(|a| a.to_string()));
     out
+}
+
+/// argv para un script CONSTANTE con datos posicionales (F14): `sh -c
+/// <script> <argv0> <args…>`. Nunca se interpola nada.
+pub fn script_args(distro: Option<&str>, script: &str, args: &[&str]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 6);
+    if let Some(distro) = distro {
+        out.push("-d".to_string());
+        out.push(distro.to_string());
+    }
+    out.push("--".to_string());
+    out.push("sh".to_string());
+    out.push("-c".to_string());
+    out.push(script.to_string());
+    out.push(SHELL_ARGV0.to_string());
+    out.extend(args.iter().map(|a| a.to_string()));
+    out
+}
+
+/// argv de limpieza del base del pidfile (éxito, error y cancelación).
+fn cleanup_args(distro: Option<&str>, base: &Path) -> Vec<String> {
+    let base_str = base.to_string_lossy().to_string();
+    script_args(distro, SCRIPT_CLEANUP, &[base_str.as_str()])
 }
 
 /// Construye el argv de una **opción de `wsl.exe`** (no de un comando):
@@ -306,12 +342,12 @@ impl<'a> WslRunner<'a> {
         shell: ShellStrategy,
         args: &[&str],
     ) -> Result<CommandOutput, WslError> {
-        let pid_dir = pidfile_dir();
-        let pid_dir_str = pid_dir.to_string_lossy().to_string();
+        let base = pidfile_base();
+        let base_str = base.to_string_lossy().to_string();
 
         // El directorio de la operación ocupa `$1`; el comando va detrás.
         let mut shell_args_all: Vec<&str> = Vec::with_capacity(args.len() + 1);
-        shell_args_all.push(pid_dir_str.as_str());
+        shell_args_all.push(base_str.as_str());
         shell_args_all.extend_from_slice(args);
 
         let argv = shell_args(Some(distro), shell, SCRIPT_EXEC_PIDFILE, &shell_args_all);
@@ -319,22 +355,37 @@ impl<'a> WslRunner<'a> {
             .runner
             .run(self.program, &argv, self.env, self.cwd, self.timeout);
 
+        // El base del pidfile no se deja atrás: se limpia en éxito y en
+        // error; en timeout lo limpia `kill_remote_process` tras cancelar.
+        let cleanup = |base: &Path| {
+            let a = cleanup_args(Some(distro), base);
+            let _ = self
+                .runner
+                .run(self.program, &a, self.env, self.cwd, self.cleanup_timeout);
+        };
+
         match outcome {
-            Ok(output) if output.code == 0 => Ok(output),
-            Ok(output) => Err(
-                super::errors::classify(&output, Some(distro)).unwrap_or_else(|| {
-                    WslError::UnparsableOutput(format!(
-                        "wsl.exe terminó con código {}",
-                        output.code
-                    ))
-                }),
-            ),
+            Ok(output) if output.code == 0 => {
+                cleanup(&base);
+                Ok(output)
+            }
+            Ok(output) => {
+                cleanup(&base);
+                Err(
+                    super::errors::classify(&output, Some(distro)).unwrap_or_else(|| {
+                        WslError::UnparsableOutput(format!(
+                            "wsl.exe terminó con código {}",
+                            output.code
+                        ))
+                    }),
+                )
+            }
             Err(RunError::Timeout) => {
                 let pid = kill_remote_process(
                     self.runner,
                     self.program,
                     distro,
-                    &pid_dir,
+                    &base,
                     self.env,
                     self.cwd,
                     self.cleanup_timeout,
@@ -364,14 +415,13 @@ fn kill_remote_process(
     runner: &dyn CommandRunner,
     program: &Path,
     distro: &str,
-    pid_dir: &Path,
+    base: &Path,
     env: &BTreeMap<String, String>,
     cwd: &Path,
     cleanup_timeout: Duration,
 ) -> i64 {
-    let pidfile = pidfile_path(pid_dir);
-    let pidfile_str = pidfile.to_string_lossy().to_string();
-    let read = direct_args(Some(distro), "cat", &[pidfile_str.as_str()]);
+    let base_str = base.to_string_lossy().to_string();
+    let read = script_args(Some(distro), SCRIPT_READ_PID, &[base_str.as_str()]);
     let pid = runner
         .run(program, &read, env, cwd, cleanup_timeout)
         .ok()
@@ -410,9 +460,8 @@ fn kill_remote_process(
         }
     }
 
-    // El directorio de la operación no se deja en la distro.
-    let pid_dir_str = pid_dir.to_string_lossy().to_string();
-    let rm = direct_args(Some(distro), "rm", &["-rf", pid_dir_str.as_str()]);
+    // El base de la operación no se deja en la distro.
+    let rm = cleanup_args(Some(distro), base);
     let _ = runner.run(program, &rm, env, cwd, cleanup_timeout);
     pid
 }
@@ -545,19 +594,64 @@ mod tests {
     /// Dos operaciones no comparten pidfile.
     #[test]
     fn pidfiles_are_unique() {
-        let a = pidfile_dir();
-        let b = pidfile_dir();
+        let a = pidfile_base();
+        let b = pidfile_base();
         assert_ne!(a, b);
         assert!(a.to_string_lossy().starts_with("/tmp/quorb-wsl-"));
-        // El pid vive dentro del directorio privado de la operación.
-        assert_eq!(pidfile_path(&a), a.join("pid"));
+    }
+
+    /// Endurecimiento del pidfile (revision del owner, 2026-10-26):
+    /// la creacion es ATOMICA y privada. El script crea el base con
+    /// `mkdir -m 700` (falla si existe -> no sigue un symlink plantado),
+    /// y dentro `mktemp -d` decide el subdirectorio. El host NUNCA escribe
+    /// el pid: solo lo lee con un glob.
+    #[test]
+    fn pidfile_creation_is_atomic_and_private() {
+        assert!(SCRIPT_EXEC_PIDFILE.contains("mkdir -m 700"));
+        assert!(SCRIPT_EXEC_PIDFILE.contains("mktemp -d"));
+        assert!(SCRIPT_EXEC_PIDFILE.contains("umask 077"));
+        // Nada de `echo >` directo sobre una ruta predecible.
+        assert!(!SCRIPT_EXEC_PIDFILE.contains("> \"$b/pid\""));
+        // La lectura descubre el subdirectorio creado por mktemp.
+        assert_eq!(SCRIPT_READ_PID, "cat \"$1\"/*/pid");
+    }
+
+    /// La limpieza es un script constante con el base como parametro: se
+    /// ejecuta en exito, error y cancelacion.
+    #[test]
+    fn cleanup_is_a_constant_script_with_the_base_as_argument() {
+        let argv = cleanup_args(Some("Ubuntu-22.04"), Path::new("/tmp/quorb-wsl-x"));
+        assert_eq!(&argv[..5], &["-d", "Ubuntu-22.04", "--", "sh", "-c"]);
+        assert_eq!(argv[5], SCRIPT_CLEANUP);
+        assert_eq!(argv[6], "quorb");
+        assert_eq!(argv[7], "/tmp/quorb-wsl-x");
+    }
+
+    /// F14: el script va como elemento de argv y los datos como
+    /// posicionales; nada se concatena.
+    #[test]
+    fn script_args_keep_script_and_data_separated() {
+        let argv = script_args(Some("Debian"), SCRIPT_READ_PID, &["/tmp/a b"]);
+        assert_eq!(
+            argv,
+            vec![
+                "-d",
+                "Debian",
+                "--",
+                "sh",
+                "-c",
+                "cat \"$1\"/*/pid",
+                "quorb",
+                "/tmp/a b"
+            ]
+        );
     }
 
     /// El directorio del pidfile no debe ser predecible: lleva el reloj de
     /// nanos, no solo un contador.
     #[test]
     fn pidfile_dir_is_not_just_a_counter() {
-        let dir = pidfile_dir().to_string_lossy().to_string();
+        let dir = pidfile_base().to_string_lossy().to_string();
         let parts: Vec<&str> = dir
             .trim_start_matches("/tmp/quorb-wsl-")
             .split('-')
@@ -653,16 +747,131 @@ mod tests {
             }
         );
         let calls = scripted.calls.lock().unwrap().clone();
-        // Tras el timeout se leyó el pidfile...
+        // Tras el timeout se leyó el pid dentro del base (script constante
+        // con glob: el nombre lo decidio `mktemp -d`).
         assert!(calls
             .iter()
-            .any(|c| c.windows(2).any(|w| w == ["--", "cat"])));
-        // ...se mató el proceso remoto (kill), sin --terminate.
+            .any(|c| c.contains(&SCRIPT_READ_PID.to_string())));
+        // ...se mató el proceso remoto (kill -TERM/-KILL), sin --terminate.
         assert!(calls
             .iter()
             .any(|c| c.iter().any(|a| a == "-TERM" || a == "-KILL")));
         assert!(calls.iter().all(|c| !c.iter().any(|a| a == "--terminate")));
-        // ...y se borró el pidfile.
-        assert!(calls.iter().any(|c| c.iter().any(|a| a == "rm")));
+        // ...y se limpió el base de la operacion.
+        assert!(calls
+            .iter()
+            .any(|c| c.contains(&SCRIPT_CLEANUP.to_string())));
+    }
+
+    /// TERM -> KILL con plazo de gracia REAL (revision del owner,
+    /// 2026-10-26). Tres casos sobre `kill_remote_process`:
+    ///  - atiende TERM y muere -> NO se escala a KILL;
+    ///  - IGNORA TERM -> si se escala a KILL;
+    ///  - ya terminado -> nada que matar (sin error).
+    /// En los tres, la distro NO se toca (nunca `--terminate`) y el base
+    /// de la operacion se limpia.
+    #[test]
+    fn kill_escalates_to_kill_only_when_term_is_ignored() {
+        use crate::cli_process::RunError;
+        use std::sync::Mutex;
+
+        struct Remote {
+            alive: Mutex<bool>,
+            term_works: bool,
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl CommandRunner for Remote {
+            fn run(
+                &self,
+                _program: &Path,
+                args: &[String],
+                _env: &BTreeMap<String, String>,
+                _cwd: &Path,
+                _timeout: Duration,
+            ) -> Result<CommandOutput, RunError> {
+                self.calls.lock().unwrap().push(args.to_vec());
+                // La lectura del pid: script constante con glob.
+                if args.contains(&SCRIPT_READ_PID.to_string()) {
+                    return Ok(CommandOutput {
+                        code: 0,
+                        stdout: "4242\n".to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                let joined = args.join(" ");
+                if joined.contains("-TERM") && self.term_works {
+                    *self.alive.lock().unwrap() = false;
+                }
+                if joined.contains("-KILL") {
+                    *self.alive.lock().unwrap() = false;
+                }
+                let code = if joined.contains("-0") {
+                    if *self.alive.lock().unwrap() {
+                        0
+                    } else {
+                        1
+                    }
+                } else {
+                    0
+                };
+                Ok(CommandOutput {
+                    code,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        fn case(term_works: bool, alive: bool) -> (i64, Vec<Vec<String>>) {
+            let remote = Remote {
+                alive: Mutex::new(alive),
+                term_works,
+                calls: Mutex::new(Vec::new()),
+            };
+            let env = BTreeMap::new();
+            let pid = kill_remote_process(
+                &remote,
+                Path::new("wsl.exe"),
+                "Ubuntu-22.04",
+                Path::new("/tmp/quorb-base"),
+                &env,
+                Path::new("."),
+                Duration::from_millis(1),
+            );
+            let calls = remote.calls.lock().unwrap().clone();
+            (pid, calls)
+        }
+
+        // 1) atiende TERM -> muere sin KILL
+        let (pid1, c1) = case(true, true);
+        assert_eq!(pid1, 4242);
+        assert!(c1.iter().any(|c| c.iter().any(|a| a == "-TERM")));
+        assert!(
+            !c1.iter().any(|c| c.iter().any(|a| a == "-KILL")),
+            "no debe escalar si TERM basta"
+        );
+
+        // 2) ignora TERM -> escala a KILL
+        let (_, c2) = case(false, true);
+        assert!(c2.iter().any(|c| c.iter().any(|a| a == "-TERM")));
+        assert!(
+            c2.iter().any(|c| c.iter().any(|a| a == "-KILL")),
+            "debe escalar si ignora TERM"
+        );
+
+        // 3) ya terminado -> sin KILL
+        let (_, c3) = case(true, false);
+        assert!(
+            !c3.iter().any(|c| c.iter().any(|a| a == "-KILL")),
+            "nada que matar"
+        );
+
+        // En ninguno se toco la distro entera; y siempre se limpio el base.
+        for calls in [&c1, &c2, &c3] {
+            assert!(calls.iter().all(|c| !c.iter().any(|a| a == "--terminate")));
+            assert!(calls
+                .iter()
+                .any(|c| c.contains(&SCRIPT_CLEANUP.to_string())));
+        }
     }
 }
