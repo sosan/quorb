@@ -188,17 +188,25 @@ jobs:
       # Gap 1 — scoped cancellation (level 1) con el pidfile ENDURECIDO
       # (5bb622b), por distro (Alpine + Ubuntu)
       # ------------------------------------------------------------------
-      - name: Diagnostico — los pids de WSL no son globales entre invocaciones
+      - name: Diagnostico — configuracion WSL e init de la distro
         shell: pwsh
         run: |
+          # Diagnostico, NO gate: registra con que configuracion se corrio el
+          # lab (afecta a la semantica de pids y al apagado por inactividad)
+          # y que init tiene cada distro (systemd vs /init de WSL).
+          # Las antiguas sondas `echo $$` se RETIRARON: dos shells que se
+          # terminan devuelven pids distintos tambien en Linux convencional
+          # y no demuestran nada sobre namespaces (objecion del reviewer,
+          # issue #90). La direccionabilidad de un proceso VIVO desde otra
+          # invocacion la prueba el Gap 1 (mismo proceso, mismo pid, kill
+          # desde otra invocacion), no estas sondas.
           $lines = Get-Content raw\distros.txt
           $distros = @($lines | ForEach-Object {
             $parts = $_ -split '=', 2
             if ($parts[1] -and $parts[1] -ne '<none>') { $parts[1] }
           })
           # Configuracion WSL global del runner: la evidencia debe
-          # registrar con que configuracion se corrio (afecta a la
-          # semantica de pids y al apagado por inactividad).
+          # registrar con que configuracion se corrio.
           $wslconfig = Join-Path $env:USERPROFILE ".wslconfig"
           if (Test-Path $wslconfig) {
             "== $wslconfig ==" | Out-File raw\wslconfig.txt
@@ -210,19 +218,11 @@ jobs:
           Get-Content raw\wslconfig.txt
           foreach ($d in $distros) {
             $tag = $d -replace '[^A-Za-z0-9]', ''
-            # El MISMO pid en dos invocaciones distintas: si difiere, cada
-            # `wsl.exe` corre en su propio namespace de pids (por eso el
-            # host no puede matar por pid SIN pasar por la distro; el
-            # adaptador siempre mata DENTRO de la distro, con `wsl -d X --
-            # kill`, nunca `kill` en el host).
-            & wsl.exe -d $d -- sh -c 'echo $$' > "raw\pid-probe-$tag-1.txt" 2>&1
-            & wsl.exe -d $d -- sh -c 'echo $$' > "raw\pid-probe-$tag-2.txt" 2>&1
-            # Y el init de la distro (systemd o el init de WSL).
+            # El init de la distro (systemd o el init de WSL) y la lista de
+            # procesos vivos en el momento del diagnostico.
             & wsl.exe -d $d -- sh -c 'cat /proc/1/comm' > "raw\ps-init-$tag.txt" 2>&1
             & wsl.exe -d $d -- ps -eo pid,args > "raw\ps-list-$tag.txt" 2>&1
             "== $d ==" | Out-File "raw\pid-diagnosis-$tag.txt"
-            "probe1: $((Get-Content "raw\pid-probe-$tag-1.txt" | Select-Object -First 1).Trim())" | Out-File "raw\pid-diagnosis-$tag.txt" -Append
-            "probe2: $((Get-Content "raw\pid-probe-$tag-2.txt" | Select-Object -First 1).Trim())" | Out-File "raw\pid-diagnosis-$tag.txt" -Append
             "init: $((Get-Content "raw\ps-init-$tag.txt" | Select-Object -First 1).Trim())" | Out-File "raw\pid-diagnosis-$tag.txt" -Append
             Get-Content "raw\pid-diagnosis-$tag.txt"
           }
@@ -574,6 +574,26 @@ jobs:
               -RedirectStandardError "raw\g1b-$tag-launch-err.txt"
             Start-Sleep -Seconds 3
             "host pid=$($p.Id)" | Set-Content "raw\g1b-$tag-hostpid.txt"
+
+            # ---------- Testigo: proceso AJENO, vivo ANTES y DESPUES ----------
+            # El reviewer requirio testigo independiente para la ruta del
+            # kill del launcher: algo que ya estaba vivo antes del timeout y
+            # debe seguir vivo despues. Misma tecnica que Gap 1: sesion
+            # separada (otro wsl.exe), pid real capturado con .Line.Trim()
+            # (el padding del ps de procps rompia el parseo en Ubuntu).
+            $witness = Start-Process -FilePath wsl.exe -PassThru -NoNewWindow `
+              -ArgumentList @("-d", $d, "--", "sleep", "900") `
+              -RedirectStandardOutput "raw\g1b-$tag-witness-launch.txt" `
+              -RedirectStandardError "raw\g1b-$tag-witness-launch-err.txt"
+            Start-Sleep -Seconds 3
+            & wsl.exe -d $d -- ps -eo pid,args > "raw\g1b-$tag-ps.txt" 2>&1
+            $witnessLine = Get-Content "raw\g1b-$tag-ps.txt" |
+              Select-String -Pattern "sleep 900" | Select-Object -First 1
+            $witnessPid = (($witnessLine.Line.Trim() -split '\s+') | Where-Object { $_ } | Select-Object -First 1)
+            & wsl.exe -d $d -- kill -0 $witnessPid > "raw\g1b-$tag-witness-before.txt" 2>&1
+            $witnessBefore = ($LASTEXITCODE -eq 0)
+            "testigo host pid=$($witness.Id) remote pid=$witnessPid vivo_antes=$witnessBefore" | Add-Content "raw\g1b-$tag-hostpid.txt"
+
             # El proceso remoto esta vivo y la distro corre.
             & wsl.exe -d $d -- ps -eo pid,args > "raw\g1b-$tag-before.txt" 2>&1
             # LO QUE HACE EL RUNNER EN EL TIMEOUT: matar el wsl.exe host.
@@ -597,9 +617,19 @@ jobs:
             else { "FAIL: el sleep sobrevivio al timeout del host" | Add-Content "raw\g1b-$tag-verdict.txt" }
             if ($distro -eq "Running") { "OK: la distro sigue viva (no se uso --terminate)" | Add-Content "raw\g1b-$tag-verdict.txt" }
             else { "INFO: estado de la distro: $distro" | Add-Content "raw\g1b-$tag-verdict.txt" }
+            # El testigo que YA estaba vivo antes debe seguir vivo despues:
+            # el kill del launcher no toca procesos ajenos.
+            & wsl.exe -d $d -- kill -0 $witnessPid > "raw\g1b-$tag-witness-after.txt" 2>&1
+            $witnessAfter = ($LASTEXITCODE -eq 0)
+            if ($witnessBefore -and $witnessAfter) { "OK: testigo vivo antes y despues del kill del launcher" | Add-Content "raw\g1b-$tag-verdict.txt" }
+            elseif (-not $witnessBefore) { "FAIL: testigo no estaba vivo antes (control roto)" | Add-Content "raw\g1b-$tag-verdict.txt" }
+            else { "FAIL: el kill del launcher se llevo al testigo ajeno" | Add-Content "raw\g1b-$tag-verdict.txt" }
             # Limpieza del base de la operacion (la sesion murio, pero el
             # base en disco sigue; el adaptador lo borra siempre).
             & wsl.exe -d $d -e sh -c $scriptCleanup quorb $dir 2>&1 | Out-Null
+            # Cierre del testigo (su sesion termina al parar el launcher).
+            Stop-Process -Id $witness.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
 
             # ---------- Timeout ANTES de que se publique el PID ----------
             # El reviewer pidio cubrir el caso "timeout antes de que se
@@ -637,7 +667,16 @@ jobs:
           # Windows (CREATE_PROCESS, igual que el adaptador) nunca toque los
           # caracteres dificiles: lo que se prueba es la doble frontera, no
           # el escaping del shell del host.
-          $script = 'exec "$@"'
+          # Contrato (revision del reviewer, 2026-10-27): el valor viaja como
+          # ARGUMENTO ORIGINAL (espacios, comillas, $, backtick, newline,
+          # glob, --, ;, C:\...), NO codificado antes de la frontera. El
+          # script es CONSTANTE y el dato va como $1 (posicional). El proceso
+          # remoto recibe el argumento y lo emite tal cual (`printf %s`); el
+          # HOST codifica la salida a base64 SOLO para guardarla en el log
+          # sin colisiones de newline/binary, y compara BYTES contra el
+          # base64 del valor original (longitud incluida). El EXIT se
+          # registra por ejecucion.
+          $script = 'printf %s "$1"'
           $lines = Get-Content raw\distros.txt
           $distros = @($lines | ForEach-Object {
             $parts = $_ -split '=', 2
@@ -665,34 +704,44 @@ jobs:
               @{ name = "backslash"; value = "C:\Users\quorb" }
             )
             foreach ($c in $cases) {
-              $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($c.value))
-              # printf %s <b64>: el b64 es el dato posicional. Si llega
-              # intacto, la doble frontera preservo la cadena de bytes.
-              & wsl.exe -d $d -e sh -c $script sh printf %s $b64 > "raw\gap2-$tag-out.txt" 2>&1
-              "EXIT=$LASTEXITCODE" | Set-Content "raw\gap2-$tag-exit.txt"
-              # El valor va SOLO en out.txt (el EXIT a otro fichero): con el
-              # valor vacio, el fichero no tiene lineas y el "EXIT=" se
-              # colaba como primera linea.
-              # [string]: un fichero vacio devuelve $null en Get-Content -Raw,
-              # y $null -eq "" es False (el caso "empty" fallaba por eso).
-              $got = [string]((Get-Content "raw\gap2-$tag-out.txt" -Raw) -replace "[\r\n]", "")
+              # El valor ORIGINAL como argumento posicional ($1 del script):
+              # pwsh pasa cada elemento como argv nativo a wsl.exe, igual
+              # que el adaptador. Nada se interpola en el script.
+              & wsl.exe -d $d -e sh -c $script sh $c.value > "raw\gap2-$tag-out.txt" 2>&1
+              $exitCode = $LASTEXITCODE
+              "EXIT=$exitCode" | Set-Content "raw\gap2-$tag-exit.txt"
+              # La salida del proceso remoto: el valor recibido byte a byte.
+              # Se lee como cadena plana (un fichero no puede contener NUL;
+              # el nuevo valor usado no tiene NUL, si lo tuviera fallaria la
+              # lectura -> FAIL explicito, nunca PASS falso).
+              $received = [string](Get-Content "raw\gap2-$tag-out.txt" -Raw)
+              # Codificar SOLO en el host, despues de recibir: comparacion de
+              # BYTES (b64 de lo recibido vs b64 del original) mas longitud.
+              $b64Orig = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($c.value))
+              $b64Got  = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($received))
+              $lenOrig = [Text.Encoding]::UTF8.GetByteCount($c.value)
+              $lenGot  = [Text.Encoding]::UTF8.GetByteCount($received)
+              # PASS solo si: exit 0, bytes identicos y longitud identica.
+              $pass = ($exitCode -eq 0 -and $b64Got -eq $b64Orig -and $lenGot -eq $lenOrig)
               $all += [pscustomobject]@{
                 distro = $d
                 case   = $c.name
-                passed = ($got -eq $b64)
-                b64    = $b64
-                got    = $got
+                passed = $pass
+                exit   = $exitCode
+                b64orig= $b64Orig
+                b64got = $b64Got
+                len    = "$lenGot/$lenOrig"
               }
             }
           }
           $all | ConvertTo-Json -Depth 3 | Set-Content raw\gap2-f14.json
           $failed = @($all | Where-Object { -not $_.passed })
           "cases=$($all.Count) failed=$($failed.Count)" | Add-Content raw\gap2-f14.txt
-          $all | Format-Table distro, case, passed -AutoSize | Out-String | Add-Content raw\gap2-f14.txt
+          $all | Format-Table distro, case, passed, exit, len -AutoSize | Out-String | Add-Content raw\gap2-f14.txt
           if ($failed.Count -gt 0) {
             "GAP2: FAIL preservacion literal en: $($failed.distro + '/' + $failed.case -join ', ')" | Add-Content raw\gap2-f14.txt
           } else {
-            "GAP2: PASS preservacion literal OK en todos los casos" | Add-Content raw\gap2-f14.txt
+            "GAP2: PASS preservacion literal (bytes + longitud + exit) en todos los casos" | Add-Content raw\gap2-f14.txt
           }
           Get-Content raw\gap2-f14.txt
           exit 0
