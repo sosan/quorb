@@ -283,9 +283,15 @@ jobs:
               -RedirectStandardError "raw\gap1-$tag-witness-launch-err.txt"
             Start-Sleep -Seconds 3
             & wsl.exe -d $d -- ps -eo pid,args > "raw\gap1-$tag-ps.txt" 2>&1
-            $witnessPid = ((Get-Content "raw\gap1-$tag-ps.txt") |
-              Select-String -Pattern "sleep 900" | Select-Object -First 1).ToString() -split '\s+' |
-              Select-Object -First 1
+            # OJO: `"  398 sleep 900" -split '\s+'` produce un elemento
+            # VACIO como primer token (el padding inicial del ps de
+            # procps). Por eso en Ubuntu el pid salia "" y el kill -0
+            # fallaba con "not a pid": el testigo VIVIA. El fix es
+            # .Line.Trim() y coger el primer token no vacio.
+            $witnessLine = Get-Content "raw\gap1-$tag-ps.txt" |
+              Select-String -Pattern "sleep 900" | Select-Object -First 1
+            $witnessTokens = $witnessLine.Line.Trim() -split '\s+'
+            $witnessPid = ($witnessTokens | Where-Object { $_ } | Select-Object -First 1)
             "witness host pid=$($witness.Id) remote pid=$witnessPid" | Add-Content "raw\gap1-$tag-dir.txt"
 
             # ---------- Caso T: TERM basta (sin escalar a KILL) ----------
