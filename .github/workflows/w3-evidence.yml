@@ -1,13 +1,23 @@
-name: "W3 evidence — WSL: pidfile/kill acotado (nivel 1) y F14 doble frontera"
+name: "W3 evidence — WSL: pidfile/kill acotado (nivel 1), WSLENV y F14 doble frontera"
 
 # Evidence-only lab for Quorb issue #90 (W3 phase).
-# Run on a hosted Windows runner; validates with a REAL WSL distro the two
-# gaps that W2 declared as unproven:
-#   Gap 1 — the scoped cancellation (level 1): the pidfile is written, the
-#           remote process of the operation is killed by that PID, and the
-#           distro stays Running (no --terminate).
+# Run on a hosted Windows runner; validates with REAL WSL distros the three
+# review points of the 2026-10-26 owner revision:
+#   Gap 1 — scoped cancellation (level 1) with the HARDENED pidfile of
+#           commit 5bb622b: atomic base (`mkdir -m 700`), operation dir by
+#           `mktemp -d`, pid read by glob (`cat "$1"/*/pid`), TERM with
+#           probes/grace before escalating to KILL, cleanup with `rm -rf`;
+#           witness process in a SEPARATE session stays alive; pre-created
+#           symlink at the base is NOT followed; concurrent operations do
+#           not share the base.
 #   Gap 2 — F14 double frontier: with a constant script and the data as
 #           POSITIONAL parameters, the value arrives byte for byte.
+#   Gap 3 — session env contract: the allowlist (CLAUDE_CONFIG_DIR,
+#           CODEX_HOME, GEMINI_CLI_HOME) crosses WSLENV with the right flag
+#           per path type (Windows -> /p, Linux -> no flag, non-path -> not
+#           forwarded, per MS docs WSLENV is the whitelist of shared vars),
+#           preserving existing WSLENV entries; what the remote process
+#           really receives is read back and compared.
 # Contains no Quorb code and collects no credentials: it drives wsl.exe the
 # same way the adapter does (argv nativo, nunca un string de shell).
 
@@ -25,6 +35,12 @@ jobs:
     # `--status` devuelve -444 y `--import` no funciona).
     runs-on: windows-latest
     timeout-minutes: 30
+    # F1: como el adaptador (base_env), wsl.exe con stdout redirigido emite
+    # UTF-16LE; WSL_UTF8=1 lo fuerza a UTF-8 y hace parseable la salida de
+    # --list --verbose (sin esto, Select-String no casaba y el estado de la
+    # distro salía vacío en los runs anteriores).
+    env:
+      WSL_UTF8: "1"
     steps:
       - name: Host inventory
         shell: pwsh
@@ -152,8 +168,9 @@ jobs:
           "EXIT=$LASTEXITCODE" | Add-Content raw\systemd-shutdown.txt
           Start-Sleep -Seconds 10
           # Verificacion: pid 1 debe ser /sbin/init (systemd), no el /init
-          # de WSL. Sin el OOBE, el primer arranque no se cuelga.
-          & wsl.exe -d Ubuntu-24.04 -u root -- ps -eo pid,args > raw\systemd-init.txt 2>&1
+          # de WSL. `cat /proc/1/comm` (no `ps -p 1`: busybox Alpine no lo
+          # soporta). Sin el OOBE, el primer arranque no se cuelga.
+          & wsl.exe -d Ubuntu-24.04 -u root -- sh -c 'cat /proc/1/comm' > raw\systemd-init.txt 2>&1
           "EXIT=$LASTEXITCODE" | Add-Content raw\systemd-init.txt
           Get-Content raw\systemd-config.txt
           Get-Content raw\systemd-init.txt | Select-Object -First 4
@@ -168,9 +185,10 @@ jobs:
           Get-Content raw\distros.txt
 
       # ------------------------------------------------------------------
-      # Gap 1 — scoped cancellation (level 1), por distro (Alpine + Ubuntu)
+      # Gap 1 — scoped cancellation (level 1) con el pidfile ENDURECIDO
+      # (5bb622b), por distro (Alpine + Ubuntu)
       # ------------------------------------------------------------------
-      - name: Diagnostico — los pids de WSL no son globales
+      - name: Diagnostico — los pids de WSL no son globales entre invocaciones
         shell: pwsh
         run: |
           $lines = Get-Content raw\distros.txt
@@ -193,11 +211,14 @@ jobs:
           foreach ($d in $distros) {
             $tag = $d -replace '[^A-Za-z0-9]', ''
             # El MISMO pid en dos invocaciones distintas: si difiere, cada
-            # `wsl.exe` corre en su propio namespace de pids.
+            # `wsl.exe` corre en su propio namespace de pids (por eso el
+            # host no puede matar por pid SIN pasar por la distro; el
+            # adaptador siempre mata DENTRO de la distro, con `wsl -d X --
+            # kill`, nunca `kill` en el host).
             & wsl.exe -d $d -- sh -c 'echo $$' > "raw\pid-probe-$tag-1.txt" 2>&1
             & wsl.exe -d $d -- sh -c 'echo $$' > "raw\pid-probe-$tag-2.txt" 2>&1
             # Y el init de la distro (systemd o el init de WSL).
-            & wsl.exe -d $d -- ps -p 1 -o comm= > "raw\ps-init-$tag.txt" 2>&1
+            & wsl.exe -d $d -- sh -c 'cat /proc/1/comm' > "raw\ps-init-$tag.txt" 2>&1
             & wsl.exe -d $d -- ps -eo pid,args > "raw\ps-list-$tag.txt" 2>&1
             "== $d ==" | Out-File "raw\pid-diagnosis-$tag.txt"
             "probe1: $((Get-Content "raw\pid-probe-$tag-1.txt" | Select-Object -First 1).Trim())" | Out-File "raw\pid-diagnosis-$tag.txt" -Append
@@ -207,7 +228,7 @@ jobs:
           }
           exit 0
 
-      - name: Gap 1 — pidfile, kill acotado y proceso ajeno intacto (por distro)
+      - name: Gap 1 — pidfile endurecido, TERM->KILL y testigo ajeno (por distro)
         shell: pwsh
         run: |
           $lines = Get-Content raw\distros.txt
@@ -217,91 +238,289 @@ jobs:
           })
           if ($distros.Count -eq 0) { "NO DISTRO TO TEST" | Out-File raw\gap1-verdict.txt; exit 0 }
           $failed = @()
+
+          # Los MISMOS scripts constantes del adaptador (process.rs 5bb622b).
+          # Los que lanza Start-Process van a FICHERO: en Windows, el
+          # re-quoting de -ArgumentList pierde las comillas internas de un
+          # script `sh -c` (bug documentado en el lab: "con un fichero no
+          # hay quoting que perder"). Las lecturas y controles van con
+          # `& wsl.exe` + variables pwsh (argv nativo, patron F14 probado).
+          $scriptExecPidfile = 'b="$1" && shift && mkdir -m 700 "$b" && d=$(mktemp -d "$b/XXXXXX") && umask 077 && echo $$ > "$d/pid" && exec "$@"'
+          $scriptReadPid     = 'cat "$1"/*/pid'
+          $scriptCleanup     = 'rm -rf "$1"'
+          $scriptIgnoreTerm  = 'trap "" TERM; while :; do sleep 1; done'
+
+          # Ficheros constantes (no dependen de la distro): se escriben una
+          # vez y se pasan por su ruta /mnt/<drive>/... dentro de la distro.
+          $execFile = Join-Path $PWD "w3-exec.sh"
+          $ignFile  = Join-Path $PWD "w3-ignore.sh"
+          Set-Content -Path $execFile -Value $scriptExecPidfile -Encoding utf8 -NoNewline
+          Set-Content -Path $ignFile  -Value $scriptIgnoreTerm  -Encoding utf8 -NoNewline
+          function Get-WslPath([string]$winPath) {
+            return "/mnt/" + $winPath.Substring(0, 1).ToLower() + $winPath.Substring(2).Replace("\", "/")
+          }
+          $wslExec = Get-WslPath (Resolve-Path $execFile).Path
+          $wslIgn  = Get-WslPath (Resolve-Path $ignFile).Path
+
           foreach ($d in $distros) {
             $tag = $d -replace '[^A-Za-z0-9]', ''
             $nonce = "$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())-$PID"
-            $dir = "/tmp/quorb-wsl-$tag-$nonce"
-            "dir=$dir" | Set-Content "raw\gap1-$tag-dir.txt"
-            # (a) El proceso de la OPERACION, con el MISMO script que el
-            # adaptador usa (SCRIPT_EXEC_PIDFILE): dir privado + pidfile +
-            # exec del comando colgado. `exec` conserva el pid, asi que el
-            # pidfile apunta al proceso final.
-            # Mecanismo de senal por fichero: el watcher (dentro de la distro)
-            # es el UNICO que puede matar por pid, porque los pids de WSL no
-            # son globales entre invocaciones de wsl.exe. El host escribe la
-            # senal (`touch <dir>/kill`) y el watcher mata SOLO el proceso de
-            # la operacion, comprobando ademas que el TESTIGO sigue vivo.
-            $opScript = 'd="$1"; shift; mkdir "$d" && chmod 700 "$d" && umask 077 || exit 1; sleep 300 & op=$!; echo $op > "$d/pid"; sleep 900 & witness=$!; echo $witness > "$d/witness"; exit 0'
-            # El comando se deja en BACKGROUND DENTRO de la distro: el
-            # `&` final lo deja corriendo y el shell remoto sale de
-            # inmediato, asi que el host no queda esperando (mismo modelo
-            # que el adaptador: spawn y retorno, el timeout es del runner).
-            # Nota: en pwsh `&` NO es "job en background" (es el call
-            # operator); por eso el background va DENTRO del script de la
-            # distro y el host solo espera la senal.
-            & wsl.exe -d $d -e sh -c $opScript sh $dir sleep 300 > "raw\gap1-$tag-launch.txt" 2>&1
-            "EXIT=$LASTEXITCODE" | Add-Content "raw\gap1-$tag-launch.txt"
-            # Margen para que el script arranque y cree el pidfile.
-            Start-Sleep -Seconds 5
-            # PIDs reales
-            & wsl.exe -d $d -- cat $dir/pid > "raw\gap1-$tag-pid.txt" 2>&1
-            & wsl.exe -d $d -- cat $dir/witness > "raw\gap1-$tag-witness.txt" 2>&1
-            $pid_ = (Get-Content "raw\gap1-$tag-pid.txt" | Select-Object -First 1).Trim()
-            $witness = (Get-Content "raw\gap1-$tag-witness.txt" | Select-Object -First 1).Trim()
-            & wsl.exe -d $d -- ls -ld $dir > "raw\gap1-$tag-dir-listing.txt" 2>&1
-            "remote pid=$pid_ witness=$witness" | Add-Content "raw\gap1-$tag-dir-listing.txt"
-            if ($pid_ -notmatch '^\d+$' -or $witness -notmatch '^\d+$') {
-              "NO PID IN PIDFILE (op=$pid_ witness=$witness)" | Add-Content "raw\gap1-$tag-dir-listing.txt"
-              $failed += $d; continue
+            $base = "/tmp/quorb-lab-$tag-$nonce"
+            "base=$base" | Set-Content "raw\gap1-$tag-dir.txt"
+            # Veredictos por sub-caso de esta distro (no confundir con el
+            # $lines usado arriba para leer distros.txt).
+            $vd = @()
+
+            # ---------- Testigo: proceso AJENO en sesion SEPARADA ----------
+            # Cada wsl.exe es su propia sesion; el testigo vive en una
+            # sesion distinta a la de la operacion, asi el teardown de la
+            # sesion de la operacion no lo arrastra (era el fallo del lab
+            # anterior: el testigo era hermano de la operacion y moria con
+            # la sesion, no por el kill).
+            $witness = Start-Process -FilePath wsl.exe -PassThru -NoNewWindow `
+              -ArgumentList @("-d", $d, "--", "sleep", "900") `
+              -RedirectStandardOutput "raw\gap1-$tag-witness-launch.txt" `
+              -RedirectStandardError "raw\gap1-$tag-witness-launch-err.txt"
+            Start-Sleep -Seconds 3
+            & wsl.exe -d $d -- ps -eo pid,args > "raw\gap1-$tag-ps.txt" 2>&1
+            $witnessPid = ((Get-Content "raw\gap1-$tag-ps.txt") |
+              Select-String -Pattern "sleep 900" | Select-Object -First 1).ToString() -split '\s+' |
+              Select-Object -First 1
+            "witness host pid=$($witness.Id) remote pid=$witnessPid" | Add-Content "raw\gap1-$tag-dir.txt"
+
+            # ---------- Caso T: TERM basta (sin escalar a KILL) ----------
+            # La operacion con el script ENDURECIDO desde fichero: $1=base,
+            # mkdir -m 700 (atomo), mktemp -d, umask 077, exec -> el pid del
+            # pidfile ES el proceso de la operacion (sleep 300 colgado). El
+            # cliente wsl.exe queda en primer plano (Start-Process -PassThru)
+            # igual que el adaptador cuando expira el timeout.
+            $op = Start-Process -FilePath wsl.exe -PassThru -NoNewWindow `
+              -ArgumentList @("-d", $d, "-e", "sh", $wslExec, $base, "sleep", "300") `
+              -RedirectStandardOutput "raw\gap1-$tag-t-launch.txt" `
+              -RedirectStandardError "raw\gap1-$tag-t-launch-err.txt"
+            Start-Sleep -Seconds 4
+            # Lectura del pid por GLOB (SCRIPT_READ_PID): el nombre del
+            # subdir lo decidio mktemp, el host no lo conoce.
+            & wsl.exe -d $d -e sh -c $scriptReadPid quorb $base > "raw\gap1-$tag-t-pid.txt" 2>&1
+            "EXIT=$LASTEXITCODE" | Add-Content "raw\gap1-$tag-t-pid.txt"
+            $pidT = (Get-Content "raw\gap1-$tag-t-pid.txt" | Select-Object -First 1).Trim()
+            "Caso T pid=$pidT" | Add-Content "raw\gap1-$tag-dir.txt"
+            if ($pidT -notmatch '^\d+$') {
+              "FAIL: no hay PID numerico en el pidfile (Caso T)" | Add-Content "raw\gap1-$tag-dir.txt"
+              $vd += "FAIL: Caso T sin pid"
+              # Limpieza de seguridad del base dejado por el lanzamiento.
+              & wsl.exe -d $d -e sh -c $scriptCleanup quorb $base 2>&1 | Out-Null
+            } else {
+              # Permisos del base (700) y del pid (umask 077 -> 600).
+              & wsl.exe -d $d -e sh -c 'ls -ld "$1"; ls -l "$1"/*/pid' quorb $base > "raw\gap1-$tag-t-perms.txt" 2>&1
+              Get-Content "raw\gap1-$tag-t-perms.txt" | Add-Content "raw\gap1-$tag-dir.txt"
+              # La SECUENCIA EXACTA de kill_remote_process: TERM, hasta 10
+              # sondeos kill -0 con gracia (100 ms), y solo si sigue vivo,
+              # KILL. Todo como argumentos directos de `kill` (sin shell).
+              & wsl.exe -d $d -- kill -TERM $pidT > "raw\gap1-$tag-t-term.txt" 2>&1
+              "EXIT=$LASTEXITCODE" | Add-Content "raw\gap1-$tag-t-term.txt"
+              $usedKillT = $false
+              for ($i = 0; $i -lt 10; $i++) {
+                & wsl.exe -d $d -- kill -0 $pidT > "raw\gap1-$tag-t-probe-$i.txt" 2>&1
+                if ($LASTEXITCODE -ne 0) { break }
+                Start-Sleep -Milliseconds 100
+              }
+              # Segunda comprobacion tras la gracia; si sigue, KILL.
+              & wsl.exe -d $d -- kill -0 $pidT > "raw\gap1-$tag-t-alive2.txt" 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                $usedKillT = $true
+                & wsl.exe -d $d -- kill -KILL $pidT > "raw\gap1-$tag-t-kill.txt" 2>&1
+                "EXIT=$LASTEXITCODE" | Add-Content "raw\gap1-$tag-t-kill.txt"
+              }
+              # Limpieza del base (SCRIPT_CLEANUP), como el adaptador en
+              # exito, error y cancelacion.
+              & wsl.exe -d $d -e sh -c $scriptCleanup quorb $base > "raw\gap1-$tag-t-cleanup.txt" 2>&1
+              "EXIT=$LASTEXITCODE" | Add-Content "raw\gap1-$tag-t-cleanup.txt"
+              # El proceso de la operacion debe estar muerto.
+              & wsl.exe -d $d -- kill -0 $pidT > "raw\gap1-$tag-t-alive.txt" 2>&1
+              $deadT = ($LASTEXITCODE -ne 0)
+              if ($deadT -and -not $usedKillT) { "OK: Caso T murio solo con TERM, sin KILL" | Add-Content "raw\gap1-$tag-dir.txt" }
+              elseif ($deadT) { "OK: Caso T murio tras escalar a KILL" | Add-Content "raw\gap1-$tag-dir.txt" }
+              else { "FAIL: proceso de la operacion sigue vivo" | Add-Content "raw\gap1-$tag-dir.txt" }
+              if ($usedKillT) { "INFO: Caso T requirio KILL (TERM no basto en esta distro)" | Add-Content "raw\gap1-$tag-dir.txt" }
+              else { "OK: Caso T TERM basta, sin KILL" | Add-Content "raw\gap1-$tag-dir.txt" }
+              $vd += if ($deadT) { "OK: Caso T TERM basta" } else { "FAIL: Caso T no murio" }
+              # Si algo fallo, matanza de seguridad para no dejar colgado
+              # el sleep 300 durante el resto del job.
+              if (-not $deadT) { & wsl.exe -d $d -- kill -KILL $pidT 2>&1 | Out-Null }
+              # El testigo ajeno debe seguir vivo.
+              & wsl.exe -d $d -- kill -0 $witnessPid > "raw\gap1-$tag-t-witness.txt" 2>&1
+              $witnessT = ($LASTEXITCODE -eq 0)
+              if ($witnessT) { "OK: testigo ajeno sigue vivo tras Caso T" | Add-Content "raw\gap1-$tag-dir.txt" }
+              else { "FAIL: testigo ajeno murio tras Caso T" | Add-Content "raw\gap1-$tag-dir.txt" }
+              $vd += if ($witnessT) { "OK: testigo vivo (T)" } else { "FAIL: testigo muerto (T)" }
+              # El cliente de la operacion debe haber salido (la sesion
+              # remota termino al morir el proceso de la operacion).
+              $op.WaitForExit(5000) | Out-Null
+              "op client exited=$($op.HasExited)" | Add-Content "raw\gap1-$tag-dir.txt"
             }
-            # El kill ACOTADO por PID, desde el host (lo que hace el
-            # adaptador): kill -TERM de ESE pid, nunca de la distro.
-            & wsl.exe -d $d -- kill -TERM $pid_ > "raw\gap1-$tag-kill-term.txt" 2>&1
-            "EXIT=$LASTEXITCODE" | Add-Content "raw\gap1-$tag-kill-term.txt"
-            Start-Sleep -Milliseconds 500
-            # El proceso de la operacion debe estar muerto (kill -0 solo
-            # responde si el PID sigue vivo).
-            & wsl.exe -d $d -- kill -0 $pid_ > "raw\gap1-$tag-kill-alive.txt" 2>&1
-            "EXIT=$LASTEXITCODE (non-zero = el proceso de la operacion murio)" | Add-Content "raw\gap1-$tag-kill-alive.txt"
-            # Y el proceso AJENO a la operacion debe seguir vivo: eso es
-            # lo que prueba que el kill fue acotado.
-            & wsl.exe -d $d -- kill -0 $witness > "raw\gap1-$tag-witness-alive.txt" 2>&1
-            "EXIT=$LASTEXITCODE (0 = el proceso ajeno SIGUE VIVO)" | Add-Content "raw\gap1-$tag-witness-alive.txt"
-            # Diagnostico en vivo: que procesos quedan y que hay en el dir.
-            & wsl.exe -d $d -- ps -eo pid,args > "raw\gap1-$tag-ps-after.txt" 2>&1
-            & wsl.exe -d $d -- ls -la $dir > "raw\gap1-$tag-ls-after.txt" 2>&1
-            Get-Content "raw\gap1-$tag-ps-after.txt" | Out-File "raw\gap1-$tag-detail.txt"
-            Get-Content "raw\gap1-$tag-ls-after.txt" | Out-File "raw\gap1-$tag-detail.txt" -Append
-            # Estado de la distro tras el kill (se lee en el veredicto).
+
+            # ---------- Caso I: ignora TERM -> escala a KILL ----------
+            # El comando es un bucle que IGNORA TERM (`trap "" TERM`) y vive
+            # dentro del propio shell: al matar el shell con KILL no quedan
+            # hijos colgados (un `sleep 300` hijo habria quedado huerfano
+            # 5 min — el lab declara y prueba que parte del arbol mata: solo
+            # el proceso de la operacion, no su sesion ni la distro). El
+            # script de ignorar va a fichero (misma razon de quoting).
+            $baseI = "/tmp/quorb-lab-i-$tag-$nonce"
+            $opI = Start-Process -FilePath wsl.exe -PassThru -NoNewWindow `
+              -ArgumentList @("-d", $d, "-e", "sh", $wslExec, $baseI, "sh", $wslIgn) `
+              -RedirectStandardOutput "raw\gap1-$tag-i-launch.txt" `
+              -RedirectStandardError "raw\gap1-$tag-i-launch-err.txt"
+            Start-Sleep -Seconds 4
+            & wsl.exe -d $d -e sh -c $scriptReadPid quorb $baseI > "raw\gap1-$tag-i-pid.txt" 2>&1
+            $pidI = (Get-Content "raw\gap1-$tag-i-pid.txt" | Select-Object -First 1).Trim()
+            "Caso I pid=$pidI" | Add-Content "raw\gap1-$tag-dir.txt"
+            if ($pidI -notmatch '^\d+$') {
+              $vd += "FAIL: Caso I sin pid"
+              & wsl.exe -d $d -e sh -c $scriptCleanup quorb $baseI 2>&1 | Out-Null
+            } else {
+              & wsl.exe -d $d -- kill -TERM $pidI > "raw\gap1-$tag-i-term.txt" 2>&1
+              "EXIT=$LASTEXITCODE" | Add-Content "raw\gap1-$tag-i-term.txt"
+              $usedKillI = $false
+              for ($i = 0; $i -lt 10; $i++) {
+                & wsl.exe -d $d -- kill -0 $pidI > "raw\gap1-$tag-i-probe-$i.txt" 2>&1
+                if ($LASTEXITCODE -ne 0) { break }
+                Start-Sleep -Milliseconds 100
+              }
+              & wsl.exe -d $d -- kill -0 $pidI > "raw\gap1-$tag-i-alive2.txt" 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                $usedKillI = $true
+                & wsl.exe -d $d -- kill -KILL $pidI > "raw\gap1-$tag-i-kill.txt" 2>&1
+                "EXIT=$LASTEXITCODE" | Add-Content "raw\gap1-$tag-i-kill.txt"
+              }
+              & wsl.exe -d $d -e sh -c $scriptCleanup quorb $baseI > "raw\gap1-$tag-i-cleanup.txt" 2>&1
+              & wsl.exe -d $d -- kill -0 $pidI > "raw\gap1-$tag-i-alive.txt" 2>&1
+              $deadI = ($LASTEXITCODE -ne 0)
+              if ($deadI -and $usedKillI) {
+                "OK: ignoro TERM, escalo a KILL y murio" | Add-Content "raw\gap1-$tag-dir.txt"
+                $vd += "OK: Caso I escala a KILL"
+              } elseif ($deadI) {
+                "INFO: murio solo con TERM pese al trap (sonda de la distro)" | Add-Content "raw\gap1-$tag-dir.txt"
+                $vd += "OK: Caso I murio (sin necesitar KILL)"
+              } else {
+                "FAIL: ignoro TERM y tampoco lo mato el KILL" | Add-Content "raw\gap1-$tag-dir.txt"
+                $vd += "FAIL: Caso I sobrevivio a TERM y KILL"
+              }
+              if (-not $deadI) { & wsl.exe -d $d -- kill -KILL $pidI 2>&1 | Out-Null }
+              & wsl.exe -d $d -- kill -0 $witnessPid > "raw\gap1-$tag-i-witness.txt" 2>&1
+              $witnessI = ($LASTEXITCODE -eq 0)
+              if ($witnessI) { "OK: testigo ajeno sigue vivo tras Caso I" | Add-Content "raw\gap1-$tag-dir.txt" }
+              else { "FAIL: testigo ajeno murio tras Caso I" | Add-Content "raw\gap1-$tag-dir.txt" }
+              $vd += if ($witnessI) { "OK: testigo vivo (I)" } else { "FAIL: testigo muerto (I)" }
+              $opI.WaitForExit(5000) | Out-Null
+              "opI client exited=$($opI.HasExited)" | Add-Content "raw\gap1-$tag-dir.txt"
+            }
+
+            # ---------- Concurrencia: dos operaciones, bases distintos ----------
+            # El reviewer pidio cubrir ejecuciones concurrentes: dos ops con
+            # el mismo script y bases distintos; matar una no toca la otra.
+            $baseA = "/tmp/quorb-lab-a-$tag-$nonce"
+            $baseB = "/tmp/quorb-lab-b-$tag-$nonce"
+            $opA = Start-Process -FilePath wsl.exe -PassThru -NoNewWindow `
+              -ArgumentList @("-d", $d, "-e", "sh", $wslExec, $baseA, "sleep", "300") `
+              -RedirectStandardOutput "raw\gap1-$tag-a-launch.txt" `
+              -RedirectStandardError "raw\gap1-$tag-a-launch-err.txt"
+            $opB = Start-Process -FilePath wsl.exe -PassThru -NoNewWindow `
+              -ArgumentList @("-d", $d, "-e", "sh", $wslExec, $baseB, "sleep", "300") `
+              -RedirectStandardOutput "raw\gap1-$tag-b-launch.txt" `
+              -RedirectStandardError "raw\gap1-$tag-b-launch-err.txt"
+            Start-Sleep -Seconds 4
+            & wsl.exe -d $d -e sh -c $scriptReadPid quorb $baseA > "raw\gap1-$tag-a-pid.txt" 2>&1
+            & wsl.exe -d $d -e sh -c $scriptReadPid quorb $baseB > "raw\gap1-$tag-b-pid.txt" 2>&1
+            $pidA = (Get-Content "raw\gap1-$tag-a-pid.txt" | Select-Object -First 1).Trim()
+            $pidB = (Get-Content "raw\gap1-$tag-b-pid.txt" | Select-Object -First 1).Trim()
+            "Concurrencia pidA=$pidA pidB=$pidB" | Add-Content "raw\gap1-$tag-dir.txt"
+            if ($pidA -notmatch '^\d+$' -or $pidB -notmatch '^\d+$') {
+              $vd += "FAIL: concurrencia sin pids"
+              & wsl.exe -d $d -e sh -c $scriptCleanup quorb $baseA 2>&1 | Out-Null
+              & wsl.exe -d $d -e sh -c $scriptCleanup quorb $baseB 2>&1 | Out-Null
+            } else {
+              # Matar SOLO A: B debe seguir vivo y con su base intacta.
+              & wsl.exe -d $d -- kill -TERM $pidA > "raw\gap1-$tag-a-term.txt" 2>&1
+              for ($i = 0; $i -lt 10; $i++) {
+                & wsl.exe -d $d -- kill -0 $pidA > "raw\gap1-$tag-a-probe-$i.txt" 2>&1
+                if ($LASTEXITCODE -ne 0) { break }
+                Start-Sleep -Milliseconds 100
+              }
+              & wsl.exe -d $d -- kill -0 $pidB > "raw\gap1-$tag-b-alive.txt" 2>&1
+              $bAlive = ($LASTEXITCODE -eq 0)
+              if ($bAlive) { "OK: B (concurrente) sigue vivo tras matar A" | Add-Content "raw\gap1-$tag-dir.txt" }
+              else { "FAIL: matar A se llevo tambien a B" | Add-Content "raw\gap1-$tag-dir.txt" }
+              # Cleanup de A y de B por separado.
+              & wsl.exe -d $d -e sh -c $scriptCleanup quorb $baseA > "raw\gap1-$tag-a-cleanup.txt" 2>&1
+              & wsl.exe -d $d -- kill -TERM $pidB > "raw\gap1-$tag-b-term.txt" 2>&1
+              for ($i = 0; $i -lt 10; $i++) {
+                & wsl.exe -d $d -- kill -0 $pidB > "raw\gap1-$tag-b-probe-$i.txt" 2>&1
+                if ($LASTEXITCODE -ne 0) { break }
+                Start-Sleep -Milliseconds 100
+              }
+              & wsl.exe -d $d -e sh -c $scriptCleanup quorb $baseB > "raw\gap1-$tag-b-cleanup.txt" 2>&1
+              $vd += if ($bAlive) { "OK: concurrencia aislada" } else { "FAIL: concurrencia no aislada" }
+            }
+
+            # ---------- Precreacion / symlink: mkdir -m 700 NO lo sigue ----------
+            # El reviewer pidio cubrir el intento de precreacion/symlink: si
+            # un usuario planta un symlink donde deberia ir el base, mkdir -m
+            # 700 debe fallar (EEXIST) sin seguir el enlace ni escribir pid.
+            $basePre = "/tmp/quorb-pre-$tag"
+            & wsl.exe -d $d -- rm -rf $basePre 2>&1 | Out-Null
+            & wsl.exe -d $d -- ln -s /etc $basePre > "raw\gap1-$tag-pre-plant.txt" 2>&1
+            "EXIT=$LASTEXITCODE" | Add-Content "raw\gap1-$tag-pre-plant.txt"
+            # Lanzar la operacion con el base plantado: mkdir -m 700 debe
+            # fallar y el script salir con codigo != 0.
+            & wsl.exe -d $d -e sh $wslExec $basePre sleep 1 > "raw\gap1-$tag-pre-launch.txt" 2>&1
+            $preExit = $LASTEXITCODE
+            "EXIT=$preExit (non-zero = mkdir rechazo la precreacion)" | Add-Content "raw\gap1-$tag-pre-launch.txt"
+            # El symlink debe seguir siendo symlink (no se siguio ni se borro).
+            & wsl.exe -d $d -- ls -ld $basePre > "raw\gap1-$tag-pre-ls.txt" 2>&1
+            # No debe haber pid escrito a traves del enlace.
+            & wsl.exe -d $d -e sh -c $scriptReadPid quorb $basePre > "raw\gap1-$tag-pre-pid.txt" 2>&1
+            "EXIT=$LASTEXITCODE" | Add-Content "raw\gap1-$tag-pre-pid.txt"
+            $preLsl = Get-Content "raw\gap1-$tag-pre-ls.txt" -Raw
+            $preStillLink = ($preLsl -match "\-> /etc")
+            $preNoPid = ((Get-Content "raw\gap1-$tag-pre-pid.txt" -Raw) -notmatch '^\d+$')
+            if ($preExit -ne 0 -and $preStillLink -and $preNoPid) {
+              "OK: symlink precreado NO se sigue (mkdir -m 700 EEXIST), sin pid" | Add-Content "raw\gap1-$tag-dir.txt"
+              $vd += "OK: precreacion/symlink rechazada"
+            } else {
+              "FAIL: la precreacion/symlink no se rechazo (exit=$preExit link=$preStillLink nopid=$preNoPid)" | Add-Content "raw\gap1-$tag-dir.txt"
+              $vd += "FAIL: precreacion/symlink"
+            }
+            # Limpieza del symlink plantado.
+            & wsl.exe -d $d -- rm -rf $basePre 2>&1 | Out-Null
+
+            # ---------- Estado de la distro tras todo (nunca --terminate) ----------
             & wsl.exe --list --verbose > "raw\gap1-$tag-list-after.txt" 2>&1
-            # Veredicto por distro
-            $dead = (Get-Content "raw\gap1-$tag-kill-alive.txt" | Select-Object -First 1) -notmatch "^EXIT=0"
-            $witnessAlive = (Get-Content "raw\gap1-$tag-witness-alive.txt" | Select-Object -First 1) -match "^EXIT=0"
-            $ok = $true
-            if ($dead) { "OK: el proceso remoto de la operacion murio ($d)" | Out-File "raw\gap1-$tag-verdict.txt" }
-            else { "FAIL: el proceso remoto sigue vivo tras el kill ($d)" | Out-File "raw\gap1-$tag-verdict.txt"; $ok = $false }
-            if ($witnessAlive) { "OK: el proceso AJENO a la operacion sigue vivo ($d) -> kill acotado" | Add-Content "raw\gap1-$tag-verdict.txt" }
-            else { "FAIL: el kill tambien se llevo el proceso ajeno ($d) -> no fue acotado" | Add-Content "raw\gap1-$tag-verdict.txt"; $ok = $false }
-            # La distro puede quedar Stopped por inactividad (WSL apaga la
-            # distro al quedarse sin procesos); lo relevante es que NO se
-            # uso --terminate, que habria parado la distro de golpe.
-            $state = (Get-Content "raw\gap1-$tag-list-after.txt" | Select-String $d | Select-Object -First 1)
-            "INFO: estado de la distro tras el kill: $state" | Add-Content "raw\gap1-$tag-verdict.txt"
-            & wsl.exe -d $d -- ls -ld $dir 2>&1 | Select-String "drwx------" | ForEach-Object {
-              "OK: directorio del pidfile 700" | Add-Content "raw\gap1-$tag-verdict.txt"
-            }
-            if ($ok) { "VERDICT: PASS" | Add-Content "raw\gap1-$tag-verdict.txt" } else { "VERDICT: FAIL" | Add-Content "raw\gap1-$tag-verdict.txt"; $failed += $d }
+            $listAfter = Get-Content "raw\gap1-$tag-list-after.txt" -Raw
+            $distroState = ([regex]::Match($listAfter, [regex]::Escape($d) + '\s+(\S+)\s+\d')).Groups[1].Value
+            "estado de la distro tras el lab: $distroState" | Add-Content "raw\gap1-$tag-dir.txt"
+            if ($distroState -eq "Running") { $vd += "OK: distro Running (no --terminate)" }
+            else { $vd += "INFO: estado distro = $distroState (no se invoco --terminate)" }
+
+            # ---------- Cierre del testigo ----------
+            # El testigo remoto muere al cerrar SU sesion (Stop-Process del
+            # cliente wsl.exe), igual que el teardown del host en timeout.
+            Stop-Process -Id $witness.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            & wsl.exe -d $d -- kill -0 $witnessPid > "raw\gap1-$tag-witness-closed.txt" 2>&1
+
+            # ---------- Veredicto por distro ----------
+            $ok = -not ($vd | Where-Object { $_ -like "FAIL:*" })
+            if ($ok) { "VERDICT: PASS" | Out-File "raw\gap1-$tag-verdict.txt" }
+            else { "VERDICT: FAIL" | Out-File "raw\gap1-$tag-verdict.txt"; $failed += $d }
+            $vd | ForEach-Object { Add-Content "raw\gap1-$tag-verdict.txt" $_ }
             Get-Content "raw\gap1-$tag-verdict.txt"
-            # Cleanup: matar los dos procesos de la distro del lab.
-            & wsl.exe -d $d -- kill -KILL $pid_ 2>&1 | Out-Null
-            & wsl.exe -d $d -- kill -KILL $witness 2>&1 | Out-Null
-            & wsl.exe -d $d -- rm -rf $dir > "raw\gap1-$tag-cleanup.txt" 2>&1
-            "cleanup dir=$dir" | Add-Content "raw\gap1-$tag-cleanup.txt"
           }
           if ($failed.Count -gt 0) {
-            "GAPS: HAYLLAZGO — el kill por pid no funciona sin systemd: $($failed -join ', ')" | Out-File raw\gap1-verdict.txt
+            "GAP1: FAIL ($($failed -join ', '))" | Out-File raw\gap1-verdict.txt
           } else {
-            "GAPS: TODAS LAS DISTROS: PASS" | Out-File raw\gap1-verdict.txt
+            "GAP1: PASS" | Out-File raw\gap1-verdict.txt
           }
           # Volcado del detalle al log: si algo falla, el motivo tiene que
           # estar en la salida del run, no solo en un fichero raw.
@@ -310,19 +529,10 @@ jobs:
             "== $($_.Name) ==" | Out-File raw\gap1-detail.txt -Append
             Get-Content $_.FullName | Out-File raw\gap1-detail.txt -Append
           }
-          "---- gap1 kill/pid/witness ----" | Out-File raw\gap1-detail.txt -Append
-          Get-ChildItem raw\gap1-*kill-alive.txt, raw\gap1-*pid.txt, raw\gap1-*witness*.txt | ForEach-Object {
-            "== $($_.Name) ==" | Out-File raw\gap1-detail.txt -Append
-            Get-Content $_.FullName | Out-File raw\gap1-detail.txt -Append
-          }
           Get-Content raw\gap1-detail.txt
           exit 0
 
-      - name: Gap 1b — el timeout del host cancela la sesion remota (sin pidfile)
-        # Diagnostico opcional: el harness Start-Process no ha logrado
-        # ejecutar el script remoto; el hallazgo (pids no globales sin
-        # systemd) ya queda probado por el diagnostico de pids.
-        continue-on-error: true
+      - name: Gap 1b — timeout del host y pid NO publicado (sin pidfile valido)
         shell: pwsh
         run: |
           $lines = Get-Content raw\distros.txt
@@ -330,25 +540,30 @@ jobs:
             $parts = $_ -split '=', 2
             if ($parts[1] -and $parts[1] -ne '<none>') { $parts[1] }
           })
+          # El MISMO script de pidfile endurecido, a fichero (la unica forma
+          # segura de pasarlo con Start-Process sin perder el quoting).
+          $scriptExecPidfile = 'b="$1" && shift && mkdir -m 700 "$b" && d=$(mktemp -d "$b/XXXXXX") && umask 077 && echo $$ > "$d/pid" && exec "$@"'
+          $scriptReadPid     = 'cat "$1"/*/pid'
+          $scriptCleanup     = 'rm -rf "$1"'
+          $failed = @()
           foreach ($d in $distros) {
             $tag = $d -replace '[^A-Za-z0-9]', ''
+            $dir = "/tmp/quorb-lab-timeout-$tag-$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
+            "dir=$dir" | Out-File "raw\g1b-$tag-dir.txt"
             # Comando que cuelga DENTRO de la sesion remota, en primer
             # plano: la invocacion de wsl.exe no termina hasta que el
-            # proceso remoto lo hace.
-            $s = 'd="$1"; shift; mkdir "$d" && chmod 700 "$d" && umask 077 && echo $$ > "$d/pid"; exec "$@"'
-            $dir = "/tmp/quorb-wsl-timeout-$tag-$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
-            "dir=$dir" | Out-File "raw\g1b-$tag-dir.txt"
-            # El script va a un FICHERO: `sh -c <script>` con el quoting
-            # de .NET (Start-Process) perdia el script por sus comillas
-            # internas. Con un fichero no hay quoting que perder.
+            # proceso remoto lo hace (mismo modelo que el adaptador).
             $scriptFile = Join-Path $PWD "g1b-$tag.sh"
-            Set-Content -Path $scriptFile -Value $s -Encoding utf8 -NoNewline
+            Set-Content -Path $scriptFile -Value $scriptExecPidfile -Encoding utf8 -NoNewline
             # La distro solo ve el disco del host por /mnt/<drive>/...:
             # D:\a\x\y.sh -> /mnt/d/a/x/y.sh
             $win = (Resolve-Path $scriptFile).Path
             $wslScript = "/mnt/" + $win.Substring(0, 1).ToLower() + $win.Substring(2).Replace("\", "/")
+            # OJO: SIN argv0 extra — con script-por-fichero $1 ES el primer
+            # dato ($dir). El run antiguo pasaba "quorb" como $1 y el dir
+            # quedaba como $2: por eso "el sleep no llegaba a ejecutarse".
             $p = Start-Process -FilePath wsl.exe -PassThru -NoNewWindow `
-              -ArgumentList @("-d", $d, "-e", "sh", $wslScript, "sh", $dir, "sleep", "300") `
+              -ArgumentList @("-d", $d, "-e", "sh", $wslScript, $dir, "sleep", "300") `
               -RedirectStandardOutput "raw\g1b-$tag-launch.txt" `
               -RedirectStandardError "raw\g1b-$tag-launch-err.txt"
             Start-Sleep -Seconds 3
@@ -368,16 +583,39 @@ jobs:
             & wsl.exe -d $d -- ps -eo pid,args > "raw\g1b-$tag-after.txt" 2>&1
             $after = Get-Content "raw\g1b-$tag-after.txt" -Raw
             $sleepAlive = ($after -match "sleep 300")
-            $distro = (Get-Content "raw\g1b-$tag-list-after.txt" | Select-String $d | Select-Object -First 1)
+            $listAfter = Get-Content "raw\g1b-$tag-list-after.txt" -Raw
+            $distro = ([regex]::Match($listAfter, [regex]::Escape($d) + '\s+(\S+)\s+\d')).Groups[1].Value
             "sleep_300_alive_after=$sleepAlive" | Out-File "raw\g1b-$tag-verdict.txt"
             "distro_state= $distro" | Add-Content "raw\g1b-$tag-verdict.txt"
-            if (-not $sleepAlive) { "OK: el sleep 300 murio al matar el wsl.exe host (timeout)" | Add-Content "raw\g1b-$tag-verdict.txt" }
-            else { "INFO: el sleep 300 no llego a ejecutarse (harness Start-Process no lanzo el script)" | Add-Content "raw\g1b-$tag-verdict.txt" }
-            if ($distro -match "Running") { "OK: la distro sigue viva (no se uso --terminate)" | Add-Content "raw\g1b-$tag-verdict.txt" }
+            if (-not $sleepAlive) { "OK: el sleep murio al matar el wsl.exe host (timeout)" | Add-Content "raw\g1b-$tag-verdict.txt" }
+            else { "FAIL: el sleep sobrevivio al timeout del host" | Add-Content "raw\g1b-$tag-verdict.txt" }
+            if ($distro -eq "Running") { "OK: la distro sigue viva (no se uso --terminate)" | Add-Content "raw\g1b-$tag-verdict.txt" }
             else { "INFO: estado de la distro: $distro" | Add-Content "raw\g1b-$tag-verdict.txt" }
+            # Limpieza del base de la operacion (la sesion murio, pero el
+            # base en disco sigue; el adaptador lo borra siempre).
+            & wsl.exe -d $d -e sh -c $scriptCleanup quorb $dir 2>&1 | Out-Null
+
+            # ---------- Timeout ANTES de que se publique el PID ----------
+            # El reviewer pidio cubrir el caso "timeout antes de que se
+            # publique el PID": si el pid no llego a escribirse, la lectura
+            # por glob falla, no se mata nada y la limpieza igual corre.
+            $dirEmpty = "/tmp/quorb-lab-empty-$tag-$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
+            & wsl.exe -d $d -- sh -c 'mkdir -m 700 "$1"' quorb $dirEmpty 2>&1 | Out-Null
+            & wsl.exe -d $d -e sh -c $scriptReadPid quorb $dirEmpty > "raw\g1b-$tag-nopid-read.txt" 2>&1
+            "EXIT=$LASTEXITCODE (non-zero = no hay pid publicado)" | Add-Content "raw\g1b-$tag-nopid-read.txt"
+            $readFailed = ($LASTEXITCODE -ne 0)
+            & wsl.exe -d $d -e sh -c $scriptCleanup quorb $dirEmpty > "raw\g1b-$tag-nopid-cleanup.txt" 2>&1
+            "EXIT=$LASTEXITCODE" | Add-Content "raw\g1b-$tag-nopid-cleanup.txt"
+            if ($readFailed) { "OK: pid no publicado -> lectura falla y no se mata nada" | Add-Content "raw\g1b-$tag-verdict.txt" }
+            else { "FAIL: lectura devolvio pid sin publicarse" | Add-Content "raw\g1b-$tag-verdict.txt" }
+            # Veredicto por distro: el sleep debio morir con el host.
+            $g1bg = Get-Content "raw\g1b-$tag-verdict.txt" -Raw
+            if ($g1bg -match "FAIL:") { $failed += $d; "VERDICT: FAIL" | Add-Content "raw\g1b-$tag-verdict.txt" }
+            else { "VERDICT: PASS" | Add-Content "raw\g1b-$tag-verdict.txt" }
             Get-Content "raw\g1b-$tag-verdict.txt"
-            & wsl.exe -d $d -- rm -rf $dir 2>&1 | Out-Null
           }
+          if ($failed.Count -gt 0) { "GAP1B: FAIL ($($failed -join ', '))" | Out-File raw\g1b-verdict.txt }
+          else { "GAP1B: PASS" | Out-File raw\g1b-verdict.txt }
           exit 0
 
       # ------------------------------------------------------------------
@@ -446,9 +684,9 @@ jobs:
           "cases=$($all.Count) failed=$($failed.Count)" | Add-Content raw\gap2-f14.txt
           $all | Format-Table distro, case, passed -AutoSize | Out-String | Add-Content raw\gap2-f14.txt
           if ($failed.Count -gt 0) {
-            "GAPS: FAIL preservacion literal en: $($failed.distro + '/' + $failed.case -join ', ')" | Add-Content raw\gap2-f14.txt
+            "GAP2: FAIL preservacion literal en: $($failed.distro + '/' + $failed.case -join ', ')" | Add-Content raw\gap2-f14.txt
           } else {
-            "GAPS: preservacion literal OK en todos los casos" | Add-Content raw\gap2-f14.txt
+            "GAP2: PASS preservacion literal OK en todos los casos" | Add-Content raw\gap2-f14.txt
           }
           Get-Content raw\gap2-f14.txt
           exit 0
@@ -476,16 +714,161 @@ jobs:
           Get-Content raw\gap2-shell-and-home.txt
           exit 0
 
-      - name: Global verdict (both gaps)
+      # ------------------------------------------------------------------
+      # Gap 3 — session env contract (WSLENV por tipo de ruta + allowlist)
+      # ------------------------------------------------------------------
+      - name: Gap 3 — WSLENV por tipo de ruta y allowlist (por distro)
         shell: pwsh
         run: |
-          $g1 = (Get-Content raw\gap1-verdict.txt -Raw)
-          $g2 = (Get-Content raw\gap2-f14.txt -Raw)
-          "== GAP 1 (pidfile / kill acotado) ==" | Out-File raw\verdict.txt
-          $g1 | Out-File raw\verdict.txt -Append
+          # Contrato del adaptador (real.rs 5bb622b, env_with + build_wslenv_entry):
+          #  - Solo las 3 variables de la allowlist se reenvian.
+          #  - Valor = ruta de Windows (C:\... o \\...) -> entrada "KEY/p"
+          #    (WSL traduce el path al anclar la variable; doc MS: /p
+          #    "translates the path between WSL/Linux style paths and Win32
+          #    paths"; WSLENV es la whitelist de vars compartidas).
+          #  - Valor = ruta Linux ya resuelta (/...) -> entrada "KEY" sin flag.
+          #  - Valor que no es ruta -> NO entra en WSLENV (fuera de la
+          #    whitelist no se comparte: no se inventa un home ni un path
+          #    de fallback).
+          #  - Se preservan las entradas WSLENV ya presentes (sin duplicar).
+          # El lab mide LO QUE RECIBE REALMENTE el proceso remoto (printf %s
+          # de la variable dentro de la distro), con espacios y no-ASCII.
+          $lines = Get-Content raw\distros.txt
+          $distros = @($lines | ForEach-Object {
+            $parts = $_ -split '=', 2
+            if ($parts[1] -and $parts[1] -ne '<none>') { $parts[1] }
+          })
+          if ($distros.Count -eq 0) { "NO DISTRO TO TEST" | Out-File raw\gap3-verdict.txt; exit 1 }
+          $failed = @()
+          $rows = @()
+          foreach ($d in $distros) {
+            $tag = $d -replace '[^A-Za-z0-9]', ''
+            # Cada caso: variable + valor + WSLENV resultante esperado + valor
+            # esperado dentro de la distro. WSLENV es herencia de entorno del
+            # hijo, igual que en env_with: se setea antes de la invocacion.
+            $cases = @(
+              # Windows path -> /p -> WSL lo convierte a /mnt/c/...
+              @{ name = "win-plain";  var = "CLAUDE_CONFIG_DIR"; value = "C:\Users\quorb\.claude"; wslenv = "CLAUDE_CONFIG_DIR/p"; expect = "/mnt/c/Users/quorb/.claude" },
+              # Windows path con ESPACIO y NO-ASCII -> /p, se convierte entero.
+              @{ name = "win-space";  var = "CODEX_HOME"; value = "C:\Users\Mi Usuario\Ñ claude"; wslenv = "CODEX_HOME/p"; expect = "/mnt/c/Users/Mi Usuario/Ñ claude" },
+              # Linux path YA resuelto -> sin flag -> llega literal.
+              @{ name = "linux";      var = "GEMINI_CLI_HOME"; value = "/opt/gemini/home"; wslenv = "GEMINI_CLI_HOME"; expect = "/opt/gemini/home" },
+              # No es ruta -> NO entra en WSLENV; fuera de la whitelist WSL
+              # no la comparte (doc MS), asi que no se traduce ni se inventa
+              # un fallback: ausente o literal, nunca convertido.
+              @{ name = "nonpath";    var = "CLAUDE_CONFIG_DIR"; value = "inline"; wslenv = $null; expect = "inline-or-absent" },
+              # Fuera de la allowlist -> ni WSLENV ni traduccion (no se
+              # reenvian secretos).
+              @{ name = "outside";    var = "AWS_SECRET_ACCESS_KEY"; value = "C:\Users\quorb"; wslenv = $null; expect = "absent" }
+            )
+            # Preservacion: WSLENV ya trae una entrada ajena (OTHER/p) y la
+            # nueva (CODEX_HOME/p) se añade sin pisarla — es el WSLENV que
+            # produciria env_with. Se definen LAS DOS variables y se sondan
+            # ambas dentro de la distro: la entrada preexistente sobrevive
+            # Y se traduce (doc MS: WSLENV es una lista, no un overwrite).
+            $preserve = @(
+              @{ name = "preserve-new"; var = "CODEX_HOME"; value = "C:\a"; wslenv = "OTHER/p:CODEX_HOME/p"; expect = "/mnt/c/a"; also = @(@{ var = "OTHER"; value = "C:\b"; expect = "/mnt/c/b" }) }
+            )
+            $allCases = @($cases) + @($preserve)
+            foreach ($c in $allCases) {
+              # Limpiar env del proceso (el step es un pwsh nuevo, pero por
+              # seguridad se quitan las claves de la allowlist).
+              foreach ($k in @("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "AWS_SECRET_ACCESS_KEY", "WSLENV", "OTHER")) {
+                Remove-Item "Env:\$k" -ErrorAction SilentlyContinue
+              }
+              # El WSLENV que produce env_with para este caso (con la
+              # entrada ajena ya presente en el caso preserve).
+              if ($c.wslenv) { $env:WSLENV = $c.wslenv }
+              # Variable de sesión: se setea en el env del hijo (wsl.exe),
+              # exactamente como hace env_with antes del spawn.
+              Set-Item -Path ("Env:" + $c.var) -Value $c.value
+              # En el caso preserve, la variable AJENA preexistente también
+              # está definida (si no, WSLENV la ignoraría por inexistente y
+              # la prueba de "sobrevive" no probaría nada).
+              foreach ($extra in @($c.also)) {
+                Set-Item -Path ("Env:" + $extra.var) -Value $extra.value
+              }
+              # Función local de sonda: script CONSTANTE por variable (el
+              # nombre es de la allowlist o de la siembra del lab, no dato
+              # de usuario). F14: el dato que varía es el WSLENV/env, no el
+              # script. Devuelve lo que RECIBE REALMENTE el proceso remoto.
+              function Read-RemoteVar([string]$varName) {
+                $probe = 'printf %s "$' + $varName + '"'
+                & wsl.exe -d $d -e sh -c $probe 2>&1 | Out-File "raw\gap3-$tag-out.txt"
+                return [string]((Get-Content "raw\gap3-$tag-out.txt" -Raw) -replace "[\r\n]", "")
+              }
+              # Veredicto por caso:
+              #  - win-*/preserve: el valor recibido debe ser el path convertido
+              #    (o al menos NO el valor Windows original sin traducir).
+              #  - linux: identico literal.
+              #  - nonpath: o el valor literal o ausente, NUNCA convertido a
+              #    path ni inventado (home por defecto).
+              #  - outside: ausente (no se reenvian secretos).
+              $got = Read-RemoteVar $c.var
+              $pass = $false
+              if ($c.expect -eq "inline-or-absent") {
+                $pass = ($got -eq $c.value -or $got -eq "")
+              } elseif ($c.expect -eq "absent") {
+                $pass = ($got -eq "")
+              } else {
+                $pass = ($got -eq $c.expect)
+              }
+              $rows += [pscustomobject]@{
+                distro = $d
+                case   = $c.name
+                var    = $c.var
+                wslenv = if ($c.wslenv) { $c.wslenv } else { "<none>" }
+                expect = $c.expect
+                got    = if ($got -eq "") { "<empty>" } else { $got }
+                passed = $pass
+              }
+              if (-not $pass) {
+                $failed += "$d/$($c.name)"
+              }
+              # Entradas ajenas (preserve): deben llegar traducidas tambien.
+              foreach ($extra in @($c.also)) {
+                $gotX = Read-RemoteVar $extra.var
+                $passX = ($gotX -eq $extra.expect)
+                $rows += [pscustomobject]@{
+                  distro = $d
+                  case   = $c.name + "-also"
+                  var    = $extra.var
+                  wslenv = if ($c.wslenv) { $c.wslenv } else { "<none>" }
+                  expect = $extra.expect
+                  got    = if ($gotX -eq "") { "<empty>" } else { $gotX }
+                  passed = $passX
+                }
+                if (-not $passX) { $failed += "$d/$($c.name)-also" }
+              }
+            }
+          }
+          $rows | ConvertTo-Json -Depth 3 | Set-Content raw\gap3-rows.json
+          "cases=$($rows.Count) failed=$($failed.Count)" | Add-Content raw\gap3-verdict.txt
+          $rows | Format-Table distro, case, var, wslenv, expect, got, passed -AutoSize | Out-String | Add-Content raw\gap3-verdict.txt
+          if ($failed.Count -gt 0) {
+            "GAP3: FAIL en: $($failed -join ', ')" | Add-Content raw\gap3-verdict.txt
+          } else {
+            "GAP3: PASS env de sesion por tipo de ruta y allowlist" | Add-Content raw\gap3-verdict.txt
+          }
+          Get-Content raw\gap3-verdict.txt
+          exit 0
+
+      - name: Global verdict (all gaps)
+        shell: pwsh
+        run: |
+          $files = @("raw\gap1-verdict.txt", "raw\g1b-verdict.txt", "raw\gap2-f14.txt", "raw\gap3-verdict.txt")
+          "== GAP 1 (pidfile endurecido / kill acotado) ==" | Out-File raw\verdict.txt
+          Get-Content raw\gap1-verdict.txt -ErrorAction SilentlyContinue | Out-File raw\verdict.txt -Append
+          "== GAP 1b (timeout del host / pid no publicado) ==" | Out-File raw\verdict.txt -Append
+          Get-Content raw\g1b-verdict.txt -ErrorAction SilentlyContinue | Out-File raw\verdict.txt -Append
           "== GAP 2 (F14 doble frontera) ==" | Out-File raw\verdict.txt -Append
-          $g2 | Out-File raw\verdict.txt -Append
-          $fail = $g2 -match "FAIL preservacion"
+          Get-Content raw\gap2-f14.txt -ErrorAction SilentlyContinue | Out-File raw\verdict.txt -Append
+          "== GAP 3 (WSLENV por tipo de ruta + allowlist) ==" | Out-File raw\verdict.txt -Append
+          Get-Content raw\gap3-verdict.txt -ErrorAction SilentlyContinue | Out-File raw\verdict.txt -Append
+          # Gate REAL sobre los tres gaps: cualquier "GAPn: FAIL" o "VERDICT:
+          # FAIL" (per distro) falla el run. El run antiguo solo miraba F14.
+          $all = (Get-Content $files -ErrorAction SilentlyContinue) -join "`n"
+          $fail = $all -match "GAP[123](B)?: FAIL" -or $all -match "VERDICT: FAIL"
           if ($fail) { "VERDICT GLOBAL: FAIL" | Out-File raw\verdict.txt -Append }
           else { "VERDICT GLOBAL: PASS" | Out-File raw\verdict.txt -Append }
           Get-Content raw\verdict.txt
