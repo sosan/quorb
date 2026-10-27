@@ -184,6 +184,11 @@ jobs:
           "ubuntu=Ubuntu-24.04" | Add-Content raw\distros.txt
           Get-Content raw\distros.txt
 
+      - name: Install Rust toolchain (para el harness F14)
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+
       # ------------------------------------------------------------------
       # Gap 1 — scoped cancellation (level 1) con el pidfile ENDURECIDO
       # (5bb622b), por distro (Alpine + Ubuntu)
@@ -657,32 +662,52 @@ jobs:
       # ------------------------------------------------------------------
       # Gap 2 — F14 double frontier: literal preservation
       # ------------------------------------------------------------------
+      - name: Build F14 probe (rustc, vía real del adaptador)
+        shell: pwsh
+        run: |
+          # El harness F14 es un binario Rust std-only (scripts/wsl-f14-probe.rs)
+          # que replica la vía de lanzamiento REAL del adaptador:
+          # Command::args -> CreateProcessW (quoting MSVCRT) -> wsl.exe ->
+          # sh -c SCRIPT_EXEC_PIDFILE -> exec. El harness pwsh anterior pasaba
+          # base64 (rechazado por el reviewer) y `& wsl.exe` de pwsh NO aplica
+          # el quoting MSVCRT: wsl.exe re-parsea la línea y los argumentos
+          # con espacios se pierden (WslClient.cpp ParseLegacyArguments).
+          # Se compila con rustc directo (sin cargo: evita tauri/build.rs y
+          # las deps del sistema; el fuente es std-only y versionado).
+          $toolchain = "stable"
+          # En el runner de Actions, rustup queda en PATH tras el paso
+          # "Install Rust toolchain" (dtolnay/rust-toolchain). Sondear.
+          if (-not (Get-Command rustc -ErrorAction SilentlyContinue)) {
+            "rustc NO DISPONIBLE — el job necesita dtolnay/rust-toolchain"
+            exit 1
+          }
+          rustc --version
+          rustc --edition 2021 -O scripts\wsl-f14-probe.rs -o wsl-f14-probe.exe
+          "compiled: $(Test-Path .\wsl-f14-probe.exe)"
+          exit 0
+
       - name: Gap 2 — F14 literal preservation a traves de las dos fronteras (por distro)
         shell: pwsh
         run: |
-          # Contrato: script CONSTANTE, datos como PARAMETROS posicionales.
-          # El valor viaja pwsh -> (argv nativo a wsl.exe) -> sh -c script
-          # constante -> proceso final, y debe llegar byte a byte.
-          # Los valores se pasan como base64 para que la capa de quoting de
-          # Windows (CREATE_PROCESS, igual que el adaptador) nunca toque los
-          # caracteres dificiles: lo que se prueba es la doble frontera, no
-          # el escaping del shell del host.
           # Contrato (revision del reviewer, 2026-10-27): el valor viaja como
           # ARGUMENTO ORIGINAL (espacios, comillas, $, backtick, newline,
-          # glob, --, ;, C:\...), NO codificado antes de la frontera. El
-          # script es CONSTANTE y el dato va como $1 (posicional). El proceso
-          # remoto recibe el argumento y lo emite tal cual (`printf %s`); el
-          # HOST codifica la salida a base64 SOLO para guardarla en el log
-          # sin colisiones de newline/binary, y compara BYTES contra el
-          # base64 del valor original (longitud incluida). El EXIT se
-          # registra por ejecucion.
-          $script = 'printf %s "$1"'
+          # glob, --, ;, C:\...), por la MISMA VIA que usa el adaptador:
+          # pwsh -> wsl-f14-probe.exe (Rust Command::args, quoting MSVCRT de
+          # CreateProcessW) -> wsl.exe -> sh -c SCRIPT_EXEC_PIDFILE -> exec.
+          # El binario devuelve JSON con la salida cruda codificada en base64
+          # (solo transporte del log) + longitud + code de salida. Aqui se
+          # compara BYTES y LONGITUD contra el valor original, y el EXIT.
+          # Cada caso ejecuta el probe UNA vez; el valor es UN argumento.
           $lines = Get-Content raw\distros.txt
           $distros = @($lines | ForEach-Object {
             $parts = $_ -split '=', 2
             if ($parts[1] -and $parts[1] -ne '<none>') { $parts[1] }
           })
           if ($distros.Count -eq 0) { "NO DISTRO TO TEST" | Out-File raw\gap2-f14.txt; exit 1 }
+          if (-not (Test-Path .\wsl-f14-probe.exe)) {
+            "FALTA wsl-f14-probe.exe (paso Build F14 probe fallo?)" | Out-File raw\gap2-f14.txt
+            exit 1
+          }
           $all = @()
           foreach ($d in $distros) {
             $tag = $d -replace '[^A-Za-z0-9]', ''
@@ -704,33 +729,31 @@ jobs:
               @{ name = "backslash"; value = "C:\Users\quorb" }
             )
             foreach ($c in $cases) {
-              # El valor ORIGINAL como argumento posicional ($1 del script):
-              # pwsh pasa cada elemento como argv nativo a wsl.exe, igual
-              # que el adaptador. Nada se interpola en el script.
-              & wsl.exe -d $d -e sh -c $script sh $c.value > "raw\gap2-$tag-out.txt" 2>&1
-              $exitCode = $LASTEXITCODE
-              "EXIT=$exitCode" | Set-Content "raw\gap2-$tag-exit.txt"
-              # La salida del proceso remoto: el valor recibido byte a byte.
-              # Se lee como cadena plana (un fichero no puede contener NUL;
-              # el nuevo valor usado no tiene NUL, si lo tuviera fallaria la
-              # lectura -> FAIL explicito, nunca PASS falso).
-              $received = [string](Get-Content "raw\gap2-$tag-out.txt" -Raw)
-              # Codificar SOLO en el host, despues de recibir: comparacion de
-              # BYTES (b64 de lo recibido vs b64 del original) mas longitud.
+              # El valor ORIGINAL como UN argumento al binario. pwsh cotiza el
+              # argumento del exe con las reglas MSVCRT (lo recibe el runtime
+              # Rust como un solo argv), y el binario lo re-lanza contra
+              # wsl.exe con Command::args. Ningun shell intermedio interpola.
+              $json = & .\wsl-f14-probe.exe $d $c.value 2> "raw\gap2-$tag-err.txt"
+              $exit = $LASTEXITCODE
+              $parsed = $null
+              try { $parsed = $json | ConvertFrom-Json } catch {}
+              if ($null -eq $parsed) {
+                $all += [pscustomobject]@{ distro=$d; case=$c.name; passed=$false; exit="probe-json"; len="n/a" }
+                continue
+              }
+              # Comparar bytes: b64(lo recibido) vs b64(original), longitud y
+              # exit del probe (el probe sale 0 aunque el command remoto
+              # falle: la info real va en .exit del JSON).
               $b64Orig = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($c.value))
-              $b64Got  = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($received))
-              $lenOrig = [Text.Encoding]::UTF8.GetByteCount($c.value)
-              $lenGot  = [Text.Encoding]::UTF8.GetByteCount($received)
-              # PASS solo si: exit 0, bytes identicos y longitud identica.
-              $pass = ($exitCode -eq 0 -and $b64Got -eq $b64Orig -and $lenGot -eq $lenOrig)
+              $pass = ($parsed.exit -eq 0 -and $parsed.stdout_b64 -eq $b64Orig -and $parsed.stdout_len -eq ([Text.Encoding]::UTF8.GetByteCount($c.value)))
               $all += [pscustomobject]@{
-                distro = $d
-                case   = $c.name
-                passed = $pass
-                exit   = $exitCode
-                b64orig= $b64Orig
-                b64got = $b64Got
-                len    = "$lenGot/$lenOrig"
+                distro  = $d
+                case    = $c.name
+                passed  = $pass
+                exit    = $parsed.exit
+                len     = "$($parsed.stdout_len)/$([Text.Encoding]::UTF8.GetByteCount($c.value))"
+                b64orig = $b64Orig
+                b64got  = $parsed.stdout_b64
               }
             }
           }
@@ -739,9 +762,9 @@ jobs:
           "cases=$($all.Count) failed=$($failed.Count)" | Add-Content raw\gap2-f14.txt
           $all | Format-Table distro, case, passed, exit, len -AutoSize | Out-String | Add-Content raw\gap2-f14.txt
           if ($failed.Count -gt 0) {
-            "GAP2: FAIL preservacion literal en: $($failed.distro + '/' + $failed.case -join ', ')" | Add-Content raw\gap2-f14.txt
+            "GAP2: FAIL preservacion literal en: $(($failed | ForEach-Object { $_.distro + '/' + $_.case }) -join ', ')" | Add-Content raw\gap2-f14.txt
           } else {
-            "GAP2: PASS preservacion literal (bytes + longitud + exit) en todos los casos" | Add-Content raw\gap2-f14.txt
+            "GAP2: PASS preservacion literal (bytes + longitud + exit) con la via real del adaptador" | Add-Content raw\gap2-f14.txt
           }
           Get-Content raw\gap2-f14.txt
           exit 0
