@@ -785,7 +785,9 @@ jobs:
               # En el caso preserve, la variable AJENA preexistente también
               # está definida (si no, WSLENV la ignoraría por inexistente y
               # la prueba de "sobrevive" no probaría nada).
-              foreach ($extra in @($c.also)) {
+              # OJO: @($null) en PowerShell es un array DE UN ELEMENTO null,
+              # no una lista vacía; el filtro lo convierte en lista vacía.
+              foreach ($extra in @($c.also | Where-Object { $_ })) {
                 Set-Item -Path ("Env:" + $extra.var) -Value $extra.value
               }
               # Función local de sonda: script CONSTANTE por variable (el
@@ -826,7 +828,8 @@ jobs:
                 $failed += "$d/$($c.name)"
               }
               # Entradas ajenas (preserve): deben llegar traducidas tambien.
-              foreach ($extra in @($c.also)) {
+              # (mismo filtro anti-@($null) que arriba)
+              foreach ($extra in @($c.also | Where-Object { $_ })) {
                 $gotX = Read-RemoteVar $extra.var
                 $passX = ($gotX -eq $extra.expect)
                 $rows += [pscustomobject]@{
