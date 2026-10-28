@@ -272,7 +272,9 @@ mod tests {
     #[test]
     #[ignore = "requiere escritorio Linux con D-Bus + Secret Service"]
     fn linux_legacy_migrate_once_then_legacy_is_gone() {
-        // Clave única por corrida, de la lista cerrada (misma vía que la app).
+        // Clave BASE de la lista cerrada (nan_session, sin `@`): la migración
+        // legacy solo aplica a claves sin sufijo de cuenta. En CI el keyring
+        // es efímero y vacío; el guard limpia el valor de ambos servicios.
         struct CleanupGuard(String);
         impl Drop for CleanupGuard {
             fn drop(&mut self) {
@@ -285,9 +287,15 @@ mod tests {
                 }
             }
         }
-        let key = scoped(OPENROUTER_API_KEY, &format!("openrouter:linux-migrate-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos()));
-        assert!(crate::config::is_account_id(key.split_once('@').unwrap().1), "la clave de prueba debe pasar la validación de cuentas");
-        assert!(get(&key).is_none(), "la clave única de prueba debería no existir en el destino actual");
+        let key = NAN_SESSION.to_string();
+        // Nota: la migración legacy SOLO aplica a claves BASE (sin `@`):
+        // `get()` retorna `current` sin migrar si la clave lleva sufijo de
+        // cuenta (`key.contains('@')`). Por eso el smoke usa una clave base
+        // de la lista cerrada (nan_session), no una `scoped`.
+        assert!(!key.contains('@'), "la clave de migración debe ser base, sin sufijo de cuenta");
+        assert!(ALL.contains(&key.as_str()), "la clave debe ser de la lista cerrada (entry la acepta)");
+        // En CI el keyring es efímero y vacío; el guard limpia lo que quede.
+        assert!(get(&key).is_none(), "la clave base de prueba debería no existir en el destino actual");
         let _guard = CleanupGuard(key.clone());
         // Poblar el legado DIRECTAMENTE (sin pasar por set/get, que migrarían
         // o escribirían en el destino actual): el escenario es un secreto que
