@@ -260,4 +260,49 @@ mod tests {
         set(&key, "").expect("borrado con set vacío");
         assert!(get(&key).is_none(), "la clave debería quedar eliminada");
     }
+
+    /// Smoke manual de MIGRACIÓN del servicio legado, también `#[ignore]`:
+    /// pobla el espacio legado (`LEGACY_SERVICE` = `es.egdev.ai-usage`) con
+    /// una clave, y verifica que `get()` la recupera POR LA VÍA DE MIGRACIÓN
+    /// — se lee una vez, se reescribe en el destino actual y desaparece del
+    /// legado (criterio AC2 del owner, issue #106). Sin imprimir el valor:
+    /// solo asserts. Requiere el mismo entorno de escritorio con D-Bus +
+    /// Secret Service que el round trip.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requiere escritorio Linux con D-Bus + Secret Service"]
+    fn linux_legacy_migrate_once_then_legacy_is_gone() {
+        // Clave única por corrida, de la lista cerrada (misma vía que la app).
+        struct CleanupGuard(String);
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                // Limpiar lo que haya quedado en cualquiera de los dos
+                // servicios (actual y legado), sin pasar por `get` (que
+                // migraría de nuevo).
+                let _ = set(&self.0, "");
+                if let Ok(legacy) = keyring::Entry::new(LEGACY_SERVICE, &self.0) {
+                    let _ = legacy.delete_credential();
+                }
+            }
+        }
+        let key = scoped(OPENROUTER_API_KEY, &format!("openrouter:linux-migrate-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos()));
+        assert!(crate::config::is_account_id(key.split_once('@').unwrap().1), "la clave de prueba debe pasar la validación de cuentas");
+        assert!(get(&key).is_none(), "la clave única de prueba debería no existir en el destino actual");
+        let _guard = CleanupGuard(key.clone());
+        // Poblar el legado DIRECTAMENTE (sin pasar por set/get, que migrarían
+        // o escribirían en el destino actual): el escenario es un secreto que
+        // quedó en el servicio anterior cuando se cambió el identificador.
+        let value = "valor-de-prueba-del-smoke-de-migracion"; // gitleaks:allow
+        assert!(crate::channel::current().migrate_legacy, "el perfil estable debe tener la migración activa");
+        let legacy = keyring::Entry::new(LEGACY_SERVICE, &key).expect("entry legado");
+        legacy.set_password(value).expect("set en el servicio legado"); // gitleaks:allow
+        // get() con el destino actual vacío debe recuperarlo POR MIGRACIÓN:
+        // lee el legado, lo reescribe en el actual y borra el original.
+        assert_eq!(get(&key).as_deref(), Some(value), "get debe migrar el valor legado al destino actual"); // gitleaks:allow
+        // Reescribir en el destino actual: comprobar sin volver a migrar.
+        let current = keyring::Entry::new(crate::channel::current().identifier, &key).expect("entry actual");
+        assert_eq!(current.get_password().ok().as_deref(), Some(value), "el valor debe quedar en el destino actual"); // gitleaks:allow
+        // Y desaparecer de futuras lecturas directas al legado.
+        assert!(matches!(legacy.get_password(), Err(keyring::Error::NoEntry)), "el legado debe desaparecer tras la migración");
+    }
 }
