@@ -17,7 +17,11 @@ name: "W3 evidence — WSL: pidfile/kill acotado (nivel 1), WSLENV y F14 doble f
 #           per path type (Windows -> /p, Linux -> no flag, non-path -> not
 #           forwarded, per MS docs WSLENV is the whitelist of shared vars),
 #           preserving existing WSLENV entries; what the remote process
-#           really receives is read back and compared.
+#           really receives is read back and compared. The matrix is the
+#           full allowlist x the three branches of the constructor (14
+#           checks per distro), plus the no-duplicate rule, and it asserts
+#           BOTH the WSLENV string the real constructor emits and the value
+#           the remote process receives.
 # Contains no Quorb code and collects no credentials: it drives wsl.exe the
 # same way the adapter does (argv nativo, nunca un string de shell).
 
@@ -856,52 +860,88 @@ jobs:
           $rows = @()
           foreach ($d in $distros) {
             $tag = $d -replace '[^A-Za-z0-9]', ''
-            # Cada caso: variable + valor + current (WSLENV previo) + valor
-            # esperado en la distro. El WSLENV RESULTANTE lo produce el
-            # constructor real; aquí solo se declara lo que se mide: el valor
-            # que recibe el proceso remoto (byte a byte, con espacios/Ñ).
+            # Cada caso: variable + valor + current (WSLENV previo) + el
+            # WSLENV final ESPERADO (lo que debe producir el constructor
+            # real, "null" si queda vacío) + el valor que debe recibir el
+            # proceso remoto (byte a byte, con espacios/Ñ). La matriz cubre
+            # la allowlist completa x las 3 ramas del constructor:
+            #   ruta Windows -> KEY/p   (WSL traduce a /mnt/c/...)
+            #   ruta Linux   -> KEY     (llega literal)
+            #   no-ruta      -> ausente (no entra en WSLENV)
+            # más la regla de no duplicar entradas previas (mismo nombre,
+            # con o sin flag) y la preservación de entradas ajenas.
             $cases = @(
-              # Windows path -> constructor real produce "KEY/p" -> WSL
-              # convierte a /mnt/c/...
-              @{ name = "win-plain";  var = "CLAUDE_CONFIG_DIR"; value = "C:\Users\quorb\.claude"; current = "-"; expect = "/mnt/c/Users/quorb/.claude" },
+              # Allowlist completa con ruta Windows -> "KEY/p" -> /mnt/c/...
+              @{ name = "win-plain";  var = "CLAUDE_CONFIG_DIR"; value = "C:\Users\quorb\.claude"; current = "-"; wsl = "CLAUDE_CONFIG_DIR/p"; expect = "/mnt/c/Users/quorb/.claude" },
               # Windows path con ESPACIO y NO-ASCII.
-              @{ name = "win-space";  var = "CODEX_HOME"; value = "C:\Users\Mi Usuario\Ñ claude"; current = "-"; expect = "/mnt/c/Users/Mi Usuario/Ñ claude" },
-              # Linux path YA resuelto -> sin flag -> llega literal.
-              @{ name = "linux";      var = "GEMINI_CLI_HOME"; value = "/opt/gemini/home"; current = "-"; expect = "/opt/gemini/home" },
+              @{ name = "win-space";  var = "CODEX_HOME"; value = "C:\Users\Mi Usuario\Ñ claude"; current = "-"; wsl = "CODEX_HOME/p"; expect = "/mnt/c/Users/Mi Usuario/Ñ claude" },
+              @{ name = "win-gemini"; var = "GEMINI_CLI_HOME"; value = "C:\Users\quorb\.gemini"; current = "-"; wsl = "GEMINI_CLI_HOME/p"; expect = "/mnt/c/Users/quorb/.gemini" },
+              # Allowlist completa con ruta Linux YA resuelta -> sin flag -> literal.
+              @{ name = "linux";       var = "GEMINI_CLI_HOME"; value = "/opt/gemini/home"; current = "-"; wsl = "GEMINI_CLI_HOME"; expect = "/opt/gemini/home" },
+              @{ name = "linux-codex"; var = "CODEX_HOME"; value = "/home/user/.codex"; current = "-"; wsl = "CODEX_HOME"; expect = "/home/user/.codex" },
+              @{ name = "linux-claude"; var = "CLAUDE_CONFIG_DIR"; value = "/home/user/.claude"; current = "-"; wsl = "CLAUDE_CONFIG_DIR"; expect = "/home/user/.claude" },
               # No es ruta -> el constructor devuelve null (no entra en
               # WSLENV) -> WSL no la comparte -> ausente en la distro.
               # Contrato ÚNICO: absent (el comentario y la medición coinciden).
-              @{ name = "nonpath";    var = "CLAUDE_CONFIG_DIR"; value = "inline"; current = "-"; expect = "absent" },
+              @{ name = "nonpath";    var = "CLAUDE_CONFIG_DIR"; value = "inline"; current = "-"; wsl = "null"; expect = "absent" },
+              @{ name = "nonpath-codex"; var = "CODEX_HOME"; value = "inline-512"; current = "-"; wsl = "null"; expect = "absent" },
+              @{ name = "nonpath-gemini"; var = "GEMINI_CLI_HOME"; value = "debug"; current = "-"; wsl = "null"; expect = "absent" },
               # Fuera de la allowlist -> constructor null -> no se reenvia.
-              @{ name = "outside";    var = "AWS_SECRET_ACCESS_KEY"; value = "C:\Users\quorb"; current = "-"; expect = "absent" }
+              @{ name = "outside";    var = "AWS_SECRET_ACCESS_KEY"; value = "C:\Users\quorb"; current = "-"; wsl = "null"; expect = "absent" }
             )
-            # Preservacion: WSLENV previo trae OTHER/p; el constructor real
-            # añade CODEX_HOME/p sin pisarla. Se definen ambas variables y se
-            # sondan ambas: la preexistente sobrevive y se traduce.
+            # Preservación alcanzable en producción: env_with acumula el
+            # WSLENV a través del lote de variables de sesión, así que un
+            # current real es otro var de la allowlist ya procesado (p. ej.
+            # el lote [GEMINI_CLI_HOME, CODEX_HOME]). El constructor añade
+            # CODEX_HOME/p sin pisar GEMINI_CLI_HOME/p; se sondan ambas: la
+            # preexistente sobrevive y se traduce.
             $preserve = @(
-              @{ name = "preserve-new"; var = "CODEX_HOME"; value = "C:\a"; current = "OTHER/p"; expect = "/mnt/c/a"; also = @(@{ var = "OTHER"; value = "C:\b"; expect = "/mnt/c/b" }) }
+              @{ name = "preserve-new"; var = "CODEX_HOME"; value = "C:\a"; current = "GEMINI_CLI_HOME/p"; wsl = "GEMINI_CLI_HOME/p:CODEX_HOME/p"; expect = "/mnt/c/a"; also = @(@{ var = "GEMINI_CLI_HOME"; value = "C:\b"; expect = "/mnt/c/b" }) },
+              # No duplicar: si la MISMA variable ya está en WSLENV, el constructor
+              # devuelve null y la entrada previa se conserva EXACTA (con su
+              # flag), sin añadir una segunda. La traducción sigue la marca
+              # previa: con /p llega traducida, sin flag llega literal.
+              @{ name = "dup-noflag"; var = "CODEX_HOME"; value = "C:\a"; current = "CODEX_HOME"; wsl = "CODEX_HOME"; expect = "C:\a" },
+              @{ name = "dup-flag";   var = "CODEX_HOME"; value = "C:\a"; current = "CODEX_HOME/p"; wsl = "CODEX_HOME/p"; expect = "/mnt/c/a" }
             )
             $allCases = @($cases) + @($preserve)
             foreach ($c in $allCases) {
               # Limpiar env del proceso (el step es un pwsh nuevo, pero por
               # seguridad se quitan las claves de la allowlist).
-              foreach ($k in @("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "AWS_SECRET_ACCESS_KEY", "WSLENV", "OTHER")) {
+              foreach ($k in @("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "AWS_SECRET_ACCESS_KEY", "WSLENV")) {
                 Remove-Item "Env:\$k" -ErrorAction SilentlyContinue
               }
               # Llama al CONSTRUCTOR REAL: resuelve la entrada WSLENV para
               # este caso (allowlist + flag por tipo de ruta + preservación
-              # del current). Su salida ES la política de producción, no una
-              # copia en pwsh.
+              # del current + no-duplicar). Su salida ES la política de
+              # producción, no una copia en pwsh. El probe replica env_with:
+              # devuelve el WSLENV FINAL (base previa + lo que añade el
+              # constructor), no solo la entrada nueva.
               $currentArg = if ($c.current -and $c.current -ne "-") { $c.current } else { "-" }
               $json = & .\src-tauri\target\debug\wsl-wslenv-probe.exe $c.var $c.value $currentArg 2> "raw\gap3-$tag-probe-err.txt"
               $parsed = $null
               try { $parsed = $json | ConvertFrom-Json } catch {}
               if ($null -eq $parsed) {
-                $rows += [pscustomobject]@{ distro=$d; case=$c.name; var=$c.var; wslenv="probe-json-error"; expect=$c.expect; got="n/a"; passed=$false }
+                $rows += [pscustomobject]@{ distro=$d; case=$c.name; var=$c.var; wslenv="probe-json-error"; wslExp="-"; expect=$c.expect; got="n/a"; passed=$false }
                 $failed += "$d/$($c.name)"
                 continue
               }
               $wslenvReal = $parsed.wslenv
+              # Aserción de política: el WSLENV final que produce el
+              # constructor debe ser EXACTAMENTE el esperado por caso ("null"
+              # en la matriz = "<none>" en la medición). Así se verifica la
+              # allowlist, el flag por tipo de ruta, la preservación y el
+              # no-duplicar a nivel de la cadena, no solo por recepción.
+              $wslOk = $true
+              $wslenvExpected = ""
+              if ($c.wsl) {
+                $wslenvShown = if ($wslenvReal) { $wslenvReal } else { "<none>" }
+                $wslenvExpected = if ($c.wsl -eq "null") { "<none>" } else { $c.wsl }
+                $wslOk = ($wslenvShown -eq $wslenvExpected)
+                if (-not $wslOk) {
+                  $failed += "$d/$($c.name)/wslenv"
+                }
+              }
               # Aplicar el WSLENV producido por el constructor (o ninguno si
               # devolvió null: la variable no se comparte a la distro).
               if ($wslenvReal) { $env:WSLENV = $wslenvReal }
@@ -942,9 +982,10 @@ jobs:
                 case   = $c.name
                 var    = $c.var
                 wslenv = if ($wslenvReal) { $wslenvReal } else { "<none>" }
+                wslExp = $wslenvExpected
                 expect = $c.expect
                 got    = if ($got -eq "") { "<empty>" } else { $got }
-                passed = $pass
+                passed = ($pass -and $wslOk)
               }
               if (-not $pass) {
                 $failed += "$d/$($c.name)"
@@ -959,6 +1000,7 @@ jobs:
                   case   = $c.name + "-also"
                   var    = $extra.var
                   wslenv = if ($wslenvReal) { $wslenvReal } else { "<none>" }
+                  wslExp = $wslenvExpected
                   expect = $extra.expect
                   got    = if ($gotX -eq "") { "<empty>" } else { $gotX }
                   passed = $passX
@@ -968,8 +1010,8 @@ jobs:
             }
           }
           $rows | ConvertTo-Json -Depth 3 | Set-Content raw\gap3-rows.json
-          "cases=$($rows.Count) failed=$($failed.Count) (7 por distro)" | Add-Content raw\gap3-verdict.txt
-          $rows | Format-Table distro, case, var, wslenv, expect, got, passed -AutoSize | Out-String | Add-Content raw\gap3-verdict.txt
+          "cases=$($rows.Count) failed=$($failed.Count) (14 por distro)" | Add-Content raw\gap3-verdict.txt
+          $rows | Format-Table distro, case, var, wslenv, wslExp, expect, got, passed -AutoSize | Out-String | Add-Content raw\gap3-verdict.txt
           if ($failed.Count -gt 0) {
             "GAP3: FAIL en: $($failed -join ', ')" | Add-Content raw\gap3-verdict.txt
           } else {
