@@ -185,7 +185,7 @@ fn is_linux_path(value: &str) -> bool {
 ///
 /// Preserva las entradas ya presentes (con o sin flags) y no duplica.
 /// Devuelve el `WSLENV` ampliado.
-fn build_wslenv_entry(key: &str, value: &str, current: &str) -> Option<String> {
+pub fn build_wslenv_entry(key: &str, value: &str, current: &str) -> Option<String> {
     if !SESSION_ENV_ALLOWLIST.contains(&key) {
         return None;
     }
