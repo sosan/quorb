@@ -6,7 +6,7 @@
 //!
 //! Decisiones del paso 0: `ADR-W2.md`. Contrato firmado: `W2-WSLADAPTER.md`.
 
-use crate::cli_process::{CommandOutput, RunError};
+pub use crate::cli_process::{CommandOutput, RunError};
 use std::path::{Path, PathBuf};
 
 mod errors;

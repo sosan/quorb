@@ -99,7 +99,11 @@ impl RealWslAdapter {
     /// (traducción de path Windows→Linux por el propio WSL): sin eso, una
     /// var como `CODEX_HOME=C:\Users\...` llegaría a la distro sin traducir
     /// y el comando no encontraría las rutas (contrato W1 §5/§7).
-    fn env_with(&self, extra: &[(&str, &str)]) -> BTreeMap<String, String> {
+    ///
+    /// Pública para que el lab W3 pueda medir el WSLENV que produce el
+    /// CÓDIGO REAL (misma función que `run_command` acaba usando), en vez
+    /// de duplicar la política en el harness.
+    pub fn env_with(&self, extra: &[(&str, &str)]) -> BTreeMap<String, String> {
         let mut env = self.env.clone();
         let mut wslenv = env.get("WSLENV").cloned().unwrap_or_default();
         for (k, v) in extra {
@@ -180,8 +184,11 @@ fn is_linux_path(value: &str) -> bool {
 /// - Ruta de Windows → `KEY/p` (WSL traduce el path al anclar la variable).
 /// - Ruta Linux ya resuelta → `KEY` sin flag: no hay nada que convertir y
 ///   la marca `/p` la estropearía.
-/// - Valor que no es ruta → `None`: no hace falta `WSLENV` (viaja en el
-///   entorno del proceso).
+/// - Valor que no es ruta → `None`: no entra en `WSLENV`. La variable se
+///   inserta en el entorno del proceso `wsl.exe`, pero WSL solo reenvía a
+///   la distro lo listado en `WSLENV` (la whitelist), así que el proceso
+///   remoto NO la recibe (ausente). El contrato es la ausencia, no el
+///   transporte en el entorno del host.
 ///
 /// Preserva las entradas ya presentes (con o sin flags) y no duplica.
 /// Devuelve el `WSLENV` ampliado.

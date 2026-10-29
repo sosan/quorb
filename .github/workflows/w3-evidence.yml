@@ -18,12 +18,17 @@ name: "W3 evidence — WSL: pidfile/kill acotado (nivel 1), WSLENV y F14 doble f
 #           forwarded, per MS docs WSLENV is the whitelist of shared vars),
 #           preserving existing WSLENV entries; what the remote process
 #           really receives is read back and compared. The matrix is the
-#           full allowlist x the three branches of the constructor (14
-#           checks per distro), plus the no-duplicate rule, and it asserts
-#           BOTH the WSLENV string the real constructor emits and the value
-#           the remote process receives.
-# Contains no Quorb code and collects no credentials: it drives wsl.exe the
-# same way the adapter does (argv nativo, nunca un string de shell).
+#           full allowlist x the three branches of the constructor plus the
+#           no-duplicate rule, and it asserts BOTH the WSLENV string that
+#           `env_with` produces and the value the remote process receives.
+#           The spawn goes through the REAL ADAPTER (run_command -> env_with
+#           -> ProcessRunner with env_clear().envs()); the remote command is
+#           the constant `env`, so absent is distinguished from empty (the
+#           equivalent of ${VAR+set}).
+# The lab compiles and executes Quorb's real WSL adapter (src-tauri/src/wsl,
+# via the example src-tauri/examples/wsl-wslenv-probe.rs) and collects no
+# credentials. Outside the adapter, wsl.exe is driven the same way the
+# adapter does (argv nativo, nunca un string de shell).
 
 on:
   workflow_dispatch:
@@ -421,12 +426,16 @@ jobs:
               & wsl.exe -d $d -e sh -c $scriptCleanup quorb $baseI > "raw\gap1-$tag-i-cleanup.txt" 2>&1
               & wsl.exe -d $d -- kill -0 $pidI > "raw\gap1-$tag-i-alive.txt" 2>&1
               $deadI = ($LASTEXITCODE -ne 0)
+              # Caso I ESTRICTO: el bucle debe IGNORAR TERM y morir SOLO por
+              # el KILL. Si murió solo con TERM, la sonda quedó invalidada
+              # (el trap no se sostuvo) y el caso NO vale: no se acredita
+              # que TERM no basta. Review 2026-10-29.
               if ($deadI -and $usedKillI) {
                 "OK: ignoro TERM, escalo a KILL y murio" | Add-Content "raw\gap1-$tag-dir.txt"
                 $vd += "OK: Caso I escala a KILL"
               } elseif ($deadI) {
-                "INFO: murio solo con TERM pese al trap (sonda de la distro)" | Add-Content "raw\gap1-$tag-dir.txt"
-                $vd += "OK: Caso I murio (sin necesitar KILL)"
+                "FAIL: murio solo con TERM pese al trap — la sonda no vale (el bucle no ignoro TERM)" | Add-Content "raw\gap1-$tag-dir.txt"
+                $vd += "FAIL: Caso I murio sin necesitar KILL (sonda de resistencia a TERM invalida)"
               } else {
                 "FAIL: ignoro TERM y tampoco lo mato el KILL" | Add-Content "raw\gap1-$tag-dir.txt"
                 $vd += "FAIL: Caso I sobrevivio a TERM y KILL"
@@ -808,214 +817,145 @@ jobs:
       # ------------------------------------------------------------------
       # Gap 3 — session env contract (WSLENV por tipo de ruta + allowlist)
       # ------------------------------------------------------------------
-      - name: Build WSLENV probe (cargo, constructor real del adaptador)
+      - name: Build WSLENV probe (cargo, example con el adaptador real)
         shell: pwsh
         run: |
-          # El Gap 3 mide la política REAL del adaptador: `wsl-wslenv-probe`
-          # (src-tauri/src/bin/) llama a `build_wslenv_entry` de la lib
-          # quorb y devuelve el WSLENV que produce para (var, value, current).
-          # Revisión del reviewer 2026-10-29: el lab antes fijaba `$env:WSLENV`
-          # a mano en pwsh (política duplicada); ahora la produce el código
-          # de producción y el run mide la traducción real en la distro.
-          # Se compila con cargo porque usa la lib quorb_lib (a diferencia del
-          # F14 probe, std-only con rustc). En Windows no necesita deps del
+          # El Gap 3 mide la política REAL del adaptador por su PROPIO
+          # lanzamiento: el example `wsl-wslenv-probe`
+          # (src-tauri/examples/) construye `RealWslAdapter::new()`
+          # (ProcessRunner real + wsl.exe descubierto), detecta el shell con
+          # `shell_strategy`, reporta el WSLENV de `env_with` (la misma
+          # fusión que usa `run_command`) y ejecuta
+          # `run_command(distro, shell, ["env"], session)`. Así se ejercitan
+          # `base_env`, `env_with` con varias variables,
+          # `env_clear().envs()` del ProcessRunner y `run_scoped`.
+          # Se compila como EXAMPLE (no entra en el producto; el antiguo
+          # src/src/bin se eliminó). En Windows no necesita deps del
           # sistema (WebView2 runtime ya está en la imagen del runner).
           if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
             "cargo NO DISPONIBLE — el job necesita dtolnay/rust-toolchain"
             exit 1
           }
-          # El Cargo.toml está en src-tauri/, no en la raíz del repo.
-          cargo build --manifest-path src-tauri\Cargo.toml -p quorb --bin wsl-wslenv-probe 2>&1 | Select-Object -Last 5
+          cargo build --manifest-path src-tauri\Cargo.toml -p quorb --example wsl-wslenv-probe 2>&1 | Select-Object -Last 5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "compiled: $(Test-Path src-tauri\target\debug\wsl-wslenv-probe.exe)"
+          "compiled: $(Test-Path src-tauri\target\debug\examples\wsl-wslenv-probe.exe)"
           exit 0
       # ------------------------------------------------------------------
-      - name: Gap 3 — WSLENV por tipo de ruta y allowlist (por distro)
+      - name: Gap 3 — WSLENV por el lanzamiento REAL del adaptador (por distro)
         shell: pwsh
         run: |
-          # Contrato del adaptador (real.rs 5bb622b, env_with + build_wslenv_entry):
+          # Contrato (real.rs env_with + build_wslenv_entry):
           #  - Solo las 3 variables de la allowlist se reenvian.
           #  - Valor = ruta de Windows (C:\... o \\...) -> entrada "KEY/p"
           #    (WSL traduce el path al anclar la variable; doc MS: /p
           #    "translates the path between WSL/Linux style paths and Win32
           #    paths"; WSLENV es la whitelist de vars compartidas).
           #  - Valor = ruta Linux ya resuelta (/...) -> entrada "KEY" sin flag.
-          #  - Valor que no es ruta -> NO entra en WSLENV (no se comparte).
-          #  - Se preservan las entradas WSLENV ya presentes (sin duplicar).
-          # Revisión del reviewer (2026-10-29): el WSLENV de cada caso lo
-          # produce el CONSTRUCTOR REAL del adaptador (wsl-wslenv-probe.exe,
-          # que llama a build_wslenv_entry de la lib quorb) — ya no se fija a
-          # mano en pwsh, ni se duplica la política.
+          #  - Valor que no es ruta -> no entra en WSLENV -> AUSENTE en la
+          #    distro (contrato único; la sonda remota `env` distingue
+          #    ausente de vacía, el equivalente de ${VAR+set}).
+          #  - Fuera de la allowlist -> AUSENTE (no se reenvia nada).
+          # Revisión del reviewer (2026-10-29): el spawn va por el ADAPTADOR
+          # REAL (run_command -> env_with -> ProcessRunner con
+          # env_clear().envs()), NO por PowerShell; no se pasa `current` a
+          # mano ni se duplica la política en pwsh. El harness reporta el
+          # WSLENV que produce env_with (código real) y lo que la distro
+          # RECIBE (env remoto parseado).
           $lines = Get-Content raw\distros.txt
           $distros = @($lines | ForEach-Object {
             $parts = $_ -split '=', 2
             if ($parts[1] -and $parts[1] -ne '<none>') { $parts[1] }
           })
           if ($distros.Count -eq 0) { "NO DISTRO TO TEST" | Out-File raw\gap3-verdict.txt; exit 1 }
-          if (-not (Test-Path src-tauri\target\debug\wsl-wslenv-probe.exe)) {
-            "FALTA src-tauri\target\debug\wsl-wslenv-probe.exe (paso Build WSLENV probe fallo?)" | Out-File raw\gap3-verdict.txt
+          $probeExe = "src-tauri\target\debug\examples\wsl-wslenv-probe.exe"
+          if (-not (Test-Path $probeExe)) {
+            "FALTA $probeExe (paso Build WSLENV probe fallo?)" | Out-File raw\gap3-verdict.txt
             exit 1
           }
           $failed = @()
           $rows = @()
           foreach ($d in $distros) {
             $tag = $d -replace '[^A-Za-z0-9]', ''
-            # Cada caso: variable + valor + current (WSLENV previo) + el
-            # WSLENV final ESPERADO (lo que debe producir el constructor
-            # real, "null" si queda vacío) + el valor que debe recibir el
-            # proceso remoto (byte a byte, con espacios/Ñ). La matriz cubre
-            # la allowlist completa x las 3 ramas del constructor:
-            #   ruta Windows -> KEY/p   (WSL traduce a /mnt/c/...)
-            #   ruta Linux   -> KEY     (llega literal)
-            #   no-ruta      -> ausente (no entra en WSLENV)
-            # más la regla de no duplicar entradas previas (mismo nombre,
-            # con o sin flag) y la preservación de entradas ajenas.
+            # Cada caso: lote de variables de sesion (KEY=VALUE) + probes a
+            # sondar + expectativas: `wsl` (cadena WSLENV exacta que debe
+            # producir env_with, "<none>" si vacia) y por probe el valor que
+            # debe recibir el proceso remoto ("absent" si debe estar ausente).
             $cases = @(
               # Allowlist completa con ruta Windows -> "KEY/p" -> /mnt/c/...
-              @{ name = "win-plain";  var = "CLAUDE_CONFIG_DIR"; value = "C:\Users\quorb\.claude"; current = "-"; wsl = "CLAUDE_CONFIG_DIR/p"; expect = "/mnt/c/Users/quorb/.claude" },
-              # Windows path con ESPACIO y NO-ASCII.
-              @{ name = "win-space";  var = "CODEX_HOME"; value = "C:\Users\Mi Usuario\Ñ claude"; current = "-"; wsl = "CODEX_HOME/p"; expect = "/mnt/c/Users/Mi Usuario/Ñ claude" },
-              @{ name = "win-gemini"; var = "GEMINI_CLI_HOME"; value = "C:\Users\quorb\.gemini"; current = "-"; wsl = "GEMINI_CLI_HOME/p"; expect = "/mnt/c/Users/quorb/.gemini" },
+              @{ name = "win-plain";   lot = @("CLAUDE_CONFIG_DIR=C:\Users\quorb\.claude"); wsl = "CLAUDE_CONFIG_DIR/p"; probes = @(@{ k = "CLAUDE_CONFIG_DIR"; expect = "/mnt/c/Users/quorb/.claude" }) },
+              @{ name = "win-space";   lot = @("CODEX_HOME=C:\Users\Mi Usuario\Ñ claude"); wsl = "CODEX_HOME/p"; probes = @(@{ k = "CODEX_HOME"; expect = "/mnt/c/Users/Mi Usuario/Ñ claude" }) },
+              @{ name = "win-gemini";  lot = @("GEMINI_CLI_HOME=C:\Users\quorb\.gemini"); wsl = "GEMINI_CLI_HOME/p"; probes = @(@{ k = "GEMINI_CLI_HOME"; expect = "/mnt/c/Users/quorb/.gemini" }) },
               # Allowlist completa con ruta Linux YA resuelta -> sin flag -> literal.
-              @{ name = "linux";       var = "GEMINI_CLI_HOME"; value = "/opt/gemini/home"; current = "-"; wsl = "GEMINI_CLI_HOME"; expect = "/opt/gemini/home" },
-              @{ name = "linux-codex"; var = "CODEX_HOME"; value = "/home/user/.codex"; current = "-"; wsl = "CODEX_HOME"; expect = "/home/user/.codex" },
-              @{ name = "linux-claude"; var = "CLAUDE_CONFIG_DIR"; value = "/home/user/.claude"; current = "-"; wsl = "CLAUDE_CONFIG_DIR"; expect = "/home/user/.claude" },
-              # No es ruta -> el constructor devuelve null (no entra en
-              # WSLENV) -> WSL no la comparte -> ausente en la distro.
-              # Contrato ÚNICO: absent (el comentario y la medición coinciden).
-              @{ name = "nonpath";    var = "CLAUDE_CONFIG_DIR"; value = "inline"; current = "-"; wsl = "null"; expect = "absent" },
-              @{ name = "nonpath-codex"; var = "CODEX_HOME"; value = "inline-512"; current = "-"; wsl = "null"; expect = "absent" },
-              @{ name = "nonpath-gemini"; var = "GEMINI_CLI_HOME"; value = "debug"; current = "-"; wsl = "null"; expect = "absent" },
-              # Fuera de la allowlist -> constructor null -> no se reenvia.
-              @{ name = "outside";    var = "AWS_SECRET_ACCESS_KEY"; value = "C:\Users\quorb"; current = "-"; wsl = "null"; expect = "absent" }
+              @{ name = "linux";       lot = @("GEMINI_CLI_HOME=/opt/gemini/home"); wsl = "GEMINI_CLI_HOME"; probes = @(@{ k = "GEMINI_CLI_HOME"; expect = "/opt/gemini/home" }) },
+              @{ name = "linux-codex"; lot = @("CODEX_HOME=/home/user/.codex"); wsl = "CODEX_HOME"; probes = @(@{ k = "CODEX_HOME"; expect = "/home/user/.codex" }) },
+              @{ name = "linux-claude"; lot = @("CLAUDE_CONFIG_DIR=/home/user/.claude"); wsl = "CLAUDE_CONFIG_DIR"; probes = @(@{ k = "CLAUDE_CONFIG_DIR"; expect = "/home/user/.claude" }) },
+              # No es ruta -> no entra en WSLENV -> AUSENTE en la distro.
+              @{ name = "nonpath";     lot = @("CLAUDE_CONFIG_DIR=inline"); wsl = "<none>"; probes = @(@{ k = "CLAUDE_CONFIG_DIR"; expect = "absent" }) },
+              @{ name = "nonpath-codex"; lot = @("CODEX_HOME=inline-512"); wsl = "<none>"; probes = @(@{ k = "CODEX_HOME"; expect = "absent" }) },
+              @{ name = "nonpath-gemini"; lot = @("GEMINI_CLI_HOME=debug"); wsl = "<none>"; probes = @(@{ k = "GEMINI_CLI_HOME"; expect = "absent" }) },
+              # Fuera de la allowlist -> no se reenvia -> AUSENTE.
+              @{ name = "outside";     lot = @("AWS_SECRET_ACCESS_KEY=C:\Users\quorb"); wsl = "<none>"; probes = @(@{ k = "AWS_SECRET_ACCESS_KEY"; expect = "absent" }) }
             )
-            # Preservación alcanzable en producción: env_with acumula el
-            # WSLENV a través del lote de variables de sesión, así que un
-            # current real es otro var de la allowlist ya procesado (p. ej.
-            # el lote [GEMINI_CLI_HOME, CODEX_HOME]). El constructor añade
-            # CODEX_HOME/p sin pisar GEMINI_CLI_HOME/p; se sondan ambas: la
-            # preexistente sobrevive y se traduce.
-            $preserve = @(
-              @{ name = "preserve-new"; var = "CODEX_HOME"; value = "C:\a"; current = "GEMINI_CLI_HOME/p"; wsl = "GEMINI_CLI_HOME/p:CODEX_HOME/p"; expect = "/mnt/c/a"; also = @(@{ var = "GEMINI_CLI_HOME"; value = "C:\b"; expect = "/mnt/c/b" }) },
-              # No duplicar: si la MISMA variable ya está en WSLENV, el constructor
-              # devuelve null y la entrada previa se conserva EXACTA (con su
-              # flag), sin añadir una segunda. La traducción sigue la marca
-              # previa: con /p llega traducida, sin flag llega literal.
-              @{ name = "dup-noflag"; var = "CODEX_HOME"; value = "C:\a"; current = "CODEX_HOME"; wsl = "CODEX_HOME"; expect = "C:\a" },
-              @{ name = "dup-flag";   var = "CODEX_HOME"; value = "C:\a"; current = "CODEX_HOME/p"; wsl = "CODEX_HOME/p"; expect = "/mnt/c/a" }
+            # Preservacion REAL (lote [GEMINI, CODEX] en UNA llamada):
+            # env_with acumula "GEMINI_CLI_HOME/p:CODEX_HOME/p" y ambas se
+            # traducen. No-duplicar REAL: la misma key dos veces en el lote
+            # no anade una segunda entrada ("CODEX_HOME/p", no
+            # "CODEX_HOME/p:CODEX_HOME/p").
+            $lotes = @(
+              @{ name = "preserve-batch"; lot = @("GEMINI_CLI_HOME=C:\b", "CODEX_HOME=C:\a"); wsl = "GEMINI_CLI_HOME/p:CODEX_HOME/p"; probes = @(@{ k = "GEMINI_CLI_HOME"; expect = "/mnt/c/b" }, @{ k = "CODEX_HOME"; expect = "/mnt/c/a" }) },
+              @{ name = "dup-same";      lot = @("CODEX_HOME=C:\a", "CODEX_HOME=C:\a"); wsl = "CODEX_HOME/p"; probes = @(@{ k = "CODEX_HOME"; expect = "/mnt/c/a" }) }
             )
-            $allCases = @($cases) + @($preserve)
+            $allCases = @($cases) + @($lotes)
             foreach ($c in $allCases) {
               # Limpiar env del proceso (el step es un pwsh nuevo, pero por
               # seguridad se quitan las claves de la allowlist).
               foreach ($k in @("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "AWS_SECRET_ACCESS_KEY", "WSLENV")) {
                 Remove-Item "Env:\$k" -ErrorAction SilentlyContinue
               }
-              # Llama al CONSTRUCTOR REAL: resuelve la entrada WSLENV para
-              # este caso (allowlist + flag por tipo de ruta + preservación
-              # del current + no-duplicar). Su salida ES la política de
-              # producción, no una copia en pwsh. El probe replica env_with:
-              # devuelve el WSLENV FINAL (base previa + lo que añade el
-              # constructor), no solo la entrada nueva.
-              $currentArg = if ($c.current -and $c.current -ne "-") { $c.current } else { "-" }
-              $json = & .\src-tauri\target\debug\wsl-wslenv-probe.exe $c.var $c.value $currentArg 2> "raw\gap3-$tag-probe-err.txt"
+              # Invocar el ADAPTADOR REAL con el lote entero.
+              $argsL = @($d) + $c.lot + @("--probe") + ($c.probes | ForEach-Object { $_.k })
+              $json = & $probeExe @argsL 2> "raw\gap3-$tag-probe-err.txt"
               $parsed = $null
               try { $parsed = $json | ConvertFrom-Json } catch {}
               if ($null -eq $parsed) {
-                $rows += [pscustomobject]@{ distro=$d; case=$c.name; var=$c.var; wslenv="probe-json-error"; wslExp="-"; expect=$c.expect; got="n/a"; passed=$false }
+                $rows += [pscustomobject]@{ distro=$d; case=$c.name; var="n/a"; wslenv="probe-json-error"; wslExp=$c.wsl; expect="n/a"; got="n/a"; passed=$false }
                 $failed += "$d/$($c.name)"
                 continue
               }
               $wslenvReal = $parsed.wslenv
-              # Aserción de política: el WSLENV final que produce el
-              # constructor debe ser EXACTAMENTE el esperado por caso ("null"
-              # en la matriz = "<none>" en la medición). Así se verifica la
-              # allowlist, el flag por tipo de ruta, la preservación y el
-              # no-duplicar a nivel de la cadena, no solo por recepción.
-              $wslOk = $true
-              $wslenvExpected = ""
-              if ($c.wsl) {
-                $wslenvShown = if ($wslenvReal) { $wslenvReal } else { "<none>" }
-                $wslenvExpected = if ($c.wsl -eq "null") { "<none>" } else { $c.wsl }
-                $wslOk = ($wslenvShown -eq $wslenvExpected)
-                if (-not $wslOk) {
-                  $failed += "$d/$($c.name)/wslenv"
-                }
-              }
-              # Aplicar el WSLENV producido por el constructor (o ninguno si
-              # devolvió null: la variable no se comparte a la distro).
-              if ($wslenvReal) { $env:WSLENV = $wslenvReal }
-              # Variable de sesión: se setea en el env del hijo (wsl.exe),
-              # exactamente como hace env_with antes del spawn.
-              Set-Item -Path ("Env:" + $c.var) -Value $c.value
-              # En el caso preserve, la variable AJENA preexistente también
-              # está definida (si no, WSLENV la ignoraría por inexistente y
-              # la prueba de "sobrevive" no probaría nada).
-              # OJO: @($null) en PowerShell es un array DE UN ELEMENTO null,
-              # no una lista vacía; el filtro lo convierte en lista vacía.
-              foreach ($extra in @($c.also | Where-Object { $_ })) {
-                Set-Item -Path ("Env:" + $extra.var) -Value $extra.value
-              }
-              # Función local de sonda: script CONSTANTE por variable (el
-              # nombre es de la allowlist o de la siembra del lab, no dato
-              # de usuario). F14: el dato que varía es el WSLENV/env, no el
-              # script. Devuelve lo que RECIBE REALMENTE el proceso remoto.
-              function Read-RemoteVar([string]$varName) {
-                $probe = 'printf %s "$' + $varName + '"'
-                & wsl.exe -d $d -e sh -c $probe 2>&1 | Out-File "raw\gap3-$tag-out.txt"
-                return [string]((Get-Content "raw\gap3-$tag-out.txt" -Raw) -replace "[\r\n]", "")
-              }
-              # Veredicto por caso:
-              #  - win-*/preserve: el valor recibido debe ser el path convertido.
-              #  - linux: identico literal.
-              #  - nonpath/outside: la var debe estar AUSENTE en la distro
-              #    (contrato único, alineado con el constructor que da null).
-              $got = Read-RemoteVar $c.var
-              $pass = $false
-              if ($c.expect -eq "absent") {
-                $pass = ($got -eq "")
-              } else {
-                $pass = ($got -eq $c.expect)
-              }
-              $rows += [pscustomobject]@{
-                distro = $d
-                case   = $c.name
-                var    = $c.var
-                wslenv = if ($wslenvReal) { $wslenvReal } else { "<none>" }
-                wslExp = $wslenvExpected
-                expect = $c.expect
-                got    = if ($got -eq "") { "<empty>" } else { $got }
-                passed = ($pass -and $wslOk)
-              }
-              if (-not $pass) {
-                $failed += "$d/$($c.name)"
-              }
-              # Entradas ajenas (preserve): deben llegar traducidas tambien.
-              # (mismo filtro anti-@($null) que arriba)
-              foreach ($extra in @($c.also | Where-Object { $_ })) {
-                $gotX = Read-RemoteVar $extra.var
-                $passX = ($gotX -eq $extra.expect)
+              $wslenvShown = if ($wslenvReal) { $wslenvReal } else { "<none>" }
+              # Asercion de politica: la cadena WSLENV que produce env_with
+              # debe ser EXACTAMENTE la esperada.
+              $wslOk = ($wslenvShown -eq $c.wsl)
+              if (-not $wslOk) { $failed += "$d/$($c.name)/wslenv" }
+              foreach ($p in $c.probes) {
+                $probe = $parsed.probes.($p.k)
+                $present = [bool]$probe.present
+                $gotVal = if ($present) { [string]$probe.value } else { "" }
+                $pass = $false
+                if ($p.expect -eq "absent") { $pass = (-not $present) }
+                else { $pass = ($present -and $gotVal -eq $p.expect) }
                 $rows += [pscustomobject]@{
                   distro = $d
-                  case   = $c.name + "-also"
-                  var    = $extra.var
-                  wslenv = if ($wslenvReal) { $wslenvReal } else { "<none>" }
-                  wslExp = $wslenvExpected
-                  expect = $extra.expect
-                  got    = if ($gotX -eq "") { "<empty>" } else { $gotX }
-                  passed = $passX
+                  case   = $c.name
+                  var    = $p.k
+                  wslenv = $wslenvShown
+                  wslExp = $c.wsl
+                  expect = $p.expect
+                  got    = if ($present) { $gotVal } else { "<absent>" }
+                  passed = ($pass -and $wslOk)
                 }
-                if (-not $passX) { $failed += "$d/$($c.name)-also" }
+                if (-not $pass) { $failed += "$d/$($c.name)/$($p.k)" }
               }
             }
           }
           $rows | ConvertTo-Json -Depth 3 | Set-Content raw\gap3-rows.json
-          "cases=$($rows.Count) failed=$($failed.Count) (14 por distro)" | Add-Content raw\gap3-verdict.txt
+          "cases=$($rows.Count) failed=$($failed.Count) (13 por distro)" | Add-Content raw\gap3-verdict.txt
           $rows | Format-Table distro, case, var, wslenv, wslExp, expect, got, passed -AutoSize | Out-String | Add-Content raw\gap3-verdict.txt
           if ($failed.Count -gt 0) {
             "GAP3: FAIL en: $($failed -join ', ')" | Add-Content raw\gap3-verdict.txt
           } else {
-            "GAP3: PASS env de sesion por tipo de ruta y allowlist (constructor real del adaptador)" | Add-Content raw\gap3-verdict.txt
+            "GAP3: PASS env de sesion por el lanzamiento REAL del adaptador (env_with + run_command)" | Add-Content raw\gap3-verdict.txt
           }
           Get-Content raw\gap3-verdict.txt
           exit 0
