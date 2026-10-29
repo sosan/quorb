@@ -820,9 +820,10 @@ jobs:
             "cargo NO DISPONIBLE — el job necesita dtolnay/rust-toolchain"
             exit 1
           }
-          cargo build -p quorb --bin wsl-wslenv-probe 2>&1 | Select-Object -Last 5
+          # El Cargo.toml está en src-tauri/, no en la raíz del repo.
+          cargo build --manifest-path src-tauri\Cargo.toml -p quorb --bin wsl-wslenv-probe 2>&1 | Select-Object -Last 5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "compiled: $(Test-Path .\target\debug\wsl-wslenv-probe.exe)"
+          "compiled: $(Test-Path src-tauri\target\debug\wsl-wslenv-probe.exe)"
           exit 0
       # ------------------------------------------------------------------
       - name: Gap 3 — WSLENV por tipo de ruta y allowlist (por distro)
@@ -847,8 +848,8 @@ jobs:
             if ($parts[1] -and $parts[1] -ne '<none>') { $parts[1] }
           })
           if ($distros.Count -eq 0) { "NO DISTRO TO TEST" | Out-File raw\gap3-verdict.txt; exit 1 }
-          if (-not (Test-Path .\target\debug\wsl-wslenv-probe.exe) -and -not (Test-Path .\wsl-wslenv-probe.exe)) {
-            "FALTA wsl-wslenv-probe.exe (paso Build WSLENV probe fallo?)" | Out-File raw\gap3-verdict.txt
+          if (-not (Test-Path src-tauri\target\debug\wsl-wslenv-probe.exe)) {
+            "FALTA src-tauri\target\debug\wsl-wslenv-probe.exe (paso Build WSLENV probe fallo?)" | Out-File raw\gap3-verdict.txt
             exit 1
           }
           $failed = @()
@@ -892,7 +893,7 @@ jobs:
               # del current). Su salida ES la política de producción, no una
               # copia en pwsh.
               $currentArg = if ($c.current -and $c.current -ne "-") { $c.current } else { "-" }
-              $json = & .\target\debug\wsl-wslenv-probe.exe $c.var $c.value $currentArg 2> "raw\gap3-$tag-probe-err.txt"
+              $json = & .\src-tauri\target\debug\wsl-wslenv-probe.exe $c.var $c.value $currentArg 2> "raw\gap3-$tag-probe-err.txt"
               $parsed = $null
               try { $parsed = $json | ConvertFrom-Json } catch {}
               if ($null -eq $parsed) {
