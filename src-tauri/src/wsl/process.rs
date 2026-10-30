@@ -20,18 +20,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Script constante: ejecuta el comando recibido como argumentos, sin
-/// interpolar nada. `$0` es el nombre de cortesía; `$@` son los datos.
-pub const SCRIPT_EXEC: &str = "exec \"$@\"";
-
 /// Script constante de la sonda de shell (F12): resuelve la ruta del
 /// binario indicado como `$1` (`command -v`).
 ///
-/// NO usa `SCRIPT_EXEC`: `command` es un builtin del shell, no un
-/// binario, así que `exec command ...` falla con 127 en todas las
-/// distros (hallazgo del lab W3, 2026-10-30). La sonda se ejecuta como
-/// script constante con el dato posicional `$1` y devuelve: ruta + exit 0
-/// si el binario existe; salida vacía + exit != 0 si no.
+/// `command` es un BUILTIN del shell, no un binario: por eso la sonda NO
+/// puede ir como `exec "$@"` (fallaría con 127 en todas las distros —
+/// hallazgo del lab W3 en WSL real, 2026-10-30). El script es constante
+/// y el nombre del binario viaja como dato posicional `$1`. Devuelve:
+/// ruta + exit 0 si el binario existe; salida vacía + exit != 0 si no.
 pub const SCRIPT_COMMAND_V: &str = "command -v \"$1\"";
 
 /// Script constante con pidfile endurecido.
@@ -580,8 +576,8 @@ mod tests {
         let argv = shell_args(
             Some("Ubuntu-22.04"),
             ShellStrategy::BashLogin,
-            SCRIPT_EXEC,
-            &["/home/u/.claude/.credentials.json", "con espacio"],
+            SCRIPT_COMMAND_V,
+            &["bash"],
         );
         assert_eq!(
             argv,
@@ -591,10 +587,9 @@ mod tests {
                 "-e",
                 "bash",
                 "-lc",
-                "exec \"$@\"",
+                "command -v \"$1\"",
                 "quorb",
-                "/home/u/.claude/.credentials.json",
-                "con espacio"
+                "bash"
             ]
         );
     }
@@ -602,7 +597,7 @@ mod tests {
     /// El fallback POSIX usa `-e sh -c`.
     #[test]
     fn shell_args_use_posix_fallback() {
-        let argv = shell_args(None, ShellStrategy::ShPosix, SCRIPT_EXEC, &["ls"]);
+        let argv = shell_args(None, ShellStrategy::ShPosix, SCRIPT_COMMAND_V, &["bash"]);
         assert_eq!(&argv[..3], &["-e", "sh", "-c"]);
     }
 
