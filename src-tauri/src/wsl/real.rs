@@ -19,7 +19,8 @@
 
 use super::errors::{looks_utf16, parse_list_verbose, parse_passwd_home};
 use super::process::{
-    direct_args, option_args, resolve_wsl_exe, shell_args, WslRunner, WslSearchPaths, SCRIPT_EXEC,
+    direct_args, option_args, resolve_wsl_exe, shell_args, WslRunner, WslSearchPaths,
+    SCRIPT_COMMAND_V,
 };
 use super::{Distribution, ShellStrategy, WslAdapter, WslDiagnostic, WslError, WslState};
 use crate::cli_process::{CommandOutput, CommandRunner, ProcessRunner};
@@ -300,15 +301,23 @@ impl WslAdapter for RealWslAdapter {
 
     /// W1 §3: `command -v bash` — si existe, `-e bash -lc` (PATH de
     /// login, donde viven nvm/volta); si no, `-e sh -c`.
+    ///
+    /// La sonda usa el script constante `SCRIPT_COMMAND_V` (NO `exec`:
+    /// `command` es un builtin y `exec command` falla con 127 — hallazgo
+    /// del lab W3 en WSL real, 2026-10-30) y `control_raw` (el exit code
+    /// de la sonda es la respuesta, no un error: sin bash, `command -v`
+    /// sale con != 0 y eso significa "usa sh").
     fn shell_strategy(&self, distro: &str) -> Result<ShellStrategy, WslError> {
         let argv = shell_args(
             Some(distro),
             ShellStrategy::ShPosix,
-            SCRIPT_EXEC,
-            &["command", "-v", "bash"],
+            SCRIPT_COMMAND_V,
+            &["bash"],
         );
         let cwd = Self::cwd();
-        let output = self.runner(&self.env, &cwd).control(&argv, Some(distro))?;
+        let output = self
+            .runner(&self.env, &cwd)
+            .control_raw(&argv, Some(distro))?;
         Ok(if output.code == 0 && !output.stdout.trim().is_empty() {
             ShellStrategy::BashLogin
         } else {
@@ -532,7 +541,7 @@ mod tests {
     #[test]
     fn shell_strategy_detects_bash() {
         let runner = FakeRunner::default();
-        runner.respond("command -v bash", ok("/bin/bash\n"));
+        runner.respond("command -v \"$1\"", ok("/bin/bash\n"));
         let adapter = adapter(runner);
         assert_eq!(
             adapter.shell_strategy("Ubuntu-22.04").expect("shell"),
@@ -544,10 +553,57 @@ mod tests {
     #[test]
     fn shell_strategy_falls_back_to_posix() {
         let runner = FakeRunner::default();
-        runner.respond("command -v bash", ok(""));
+        runner.respond("command -v \"$1\"", ok(""));
         let adapter = adapter(runner);
         assert_eq!(
             adapter.shell_strategy("Ubuntu-22.04").expect("shell"),
+            ShellStrategy::ShPosix
+        );
+    }
+
+    /// La sonda usa el script constante `command -v "$1"` (datos
+    /// posicionales), NO `exec` — en WSL real `exec command` falla con 127
+    /// porque `command` es un builtin (hallazgo del lab W3, 2026-10-30).
+    #[test]
+    fn shell_strategy_uses_command_v_script_not_exec() {
+        let runner = FakeRunner::default();
+        runner.respond("command -v \"$1\"", ok("/bin/bash\n"));
+        let adapter = adapter(runner);
+        adapter.shell_strategy("Ubuntu-22.04").expect("shell");
+        let calls = runner.calls();
+        let argv = calls.last().expect("hay una llamada");
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains("command -v \"$1\""),
+            "debe usar el script SCRIPT_COMMAND_V: {joined}"
+        );
+        assert!(
+            !joined.contains("exec"),
+            "no debe usar exec (builtin): {joined}"
+        );
+        assert!(
+            argv.ends_with(&["bash".to_string()]),
+            "el dato posicional es 'bash': {joined}"
+        );
+    }
+
+    /// En Alpine (busybox, sin bash) `command -v bash` sale con exit != 0:
+    /// eso es una RESPUESTA válida (usa sh), no un error. control_raw
+    /// devuelve el output con su código y shell_strategy elige ShPosix.
+    #[test]
+    fn shell_strategy_treats_nonzero_command_v_as_posix() {
+        let runner = FakeRunner::default();
+        runner.respond(
+            "command -v \"$1\"",
+            CommandOutput {
+                code: 127,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let adapter = adapter(runner);
+        assert_eq!(
+            adapter.shell_strategy("Alpine").expect("shell"),
             ShellStrategy::ShPosix
         );
     }

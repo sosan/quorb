@@ -24,6 +24,16 @@ use std::time::Duration;
 /// interpolar nada. `$0` es el nombre de cortesía; `$@` son los datos.
 pub const SCRIPT_EXEC: &str = "exec \"$@\"";
 
+/// Script constante de la sonda de shell (F12): resuelve la ruta del
+/// binario indicado como `$1` (`command -v`).
+///
+/// NO usa `SCRIPT_EXEC`: `command` es un builtin del shell, no un
+/// binario, así que `exec command ...` falla con 127 en todas las
+/// distros (hallazgo del lab W3, 2026-10-30). La sonda se ejecuta como
+/// script constante con el dato posicional `$1` y devuelve: ruta + exit 0
+/// si el binario existe; salida vacía + exit != 0 si no.
+pub const SCRIPT_COMMAND_V: &str = "command -v \"$1\"";
+
 /// Script constante con pidfile endurecido.
 ///
 /// `$1` es un DIRECTORIO BASE que crea este script de forma atómica con
@@ -323,6 +333,31 @@ impl<'a> WslRunner<'a> {
             self.timeout,
             distro,
         )
+    }
+
+    /// Igual que `control`, pero NO convierte un exit code distinto de 0
+    /// en error: el código de salida de una **sonda** es parte de su
+    /// respuesta (p. ej. `command -v X` devuelve != 0 cuando X no existe).
+    /// Solo `Spawn`/`Io`/`Timeout` (no poder lanzar wsl.exe) son errores.
+    pub fn control_raw(
+        &self,
+        args: &[String],
+        distro: Option<&str>,
+    ) -> Result<CommandOutput, WslError> {
+        match self
+            .runner
+            .run(self.program, args, self.env, self.cwd, self.timeout)
+        {
+            Ok(output) => Ok(output),
+            Err(RunError::Spawn) => Err(WslError::WslNotInstalled),
+            Err(RunError::Io) => Err(WslError::UnparsableOutput(
+                "wsl.exe no se pudo ejecutar (error de E/S)".into(),
+            )),
+            Err(RunError::Timeout) => Err(WslError::Timeout {
+                distro: distro.unwrap_or_default().to_string(),
+                pid: 0,
+            }),
+        }
     }
 
     /// Ejecuta un comando en la distro con **cancelación acotada**
