@@ -16,6 +16,7 @@ import { retryWithBackoff, STARTUP_RETRY, USAGE_RETRY } from './lib/startup';
 import { createSessionMonitor } from './lib/session-monitor';
 import { needsRefresh } from './lib/widget-refresh';
 import { createWidgetRecovery, shouldAuditNativePosition } from './lib/widget-recovery';
+import { placementOutcome, reasonKey, samePlacement, type WidgetPlacementReason, type WidgetPlacementReport } from './lib/widget-placement';
 import { createLatestQueue, physicalPanelBounds, samePhysical, DETAIL_EVENTS, DETAIL_WINDOW, isCurrentDetailInteraction, panelWidthFor, type DetailInteraction, type DetailState, type PhysicalBounds } from './lib/detail-panel';
 import { createDetailPresence, presenceFromPoint, shouldSampleNativePresence } from './lib/detail-presence';
 import { openDelayForOs, osFromUA } from './lib/os-detect';
@@ -24,6 +25,11 @@ import { accountTags } from './lib/accounts';
 import { clipSurfaceSafely, measureSurfaceClip } from './lib/surface-clip';
 import { peekRect, usesPeekWindow, waitForViewport, watchPreparation } from './lib/auto-hide';
 import { useDockReveal } from './lib/useDockReveal';
+import { currentDragMode, dragMode, fallbackDragMode, resetDragMode, setDragMode } from './lib/drag-session';
+import { detectWindowManager } from './lib/wm-detect';
+import { t } from './i18n';
+import { localeFrom } from './i18n/use-locale';
+import { StripFallback } from './components/StripFallback';
 
 const CLOSE_DELAY = 280;
 /**
@@ -145,6 +151,7 @@ export function Widget() {
   const [error, setError] = useState<string | null>(null);
 
   // dock
+  const locale = localeFrom(config);
   const [geo, setGeo] = useState<Geo | null>(null);
   const [stripSize, setStripSize] = useState<Size | null>(null);
   const [hovered, setHovered] = useState<string | null>(null);
@@ -160,6 +167,11 @@ export function Widget() {
   const [peekFocused, setPeekFocused] = useState(false);
   const [placementRetry, setPlacementRetry] = useState(0);
   const [placementFailed, setPlacementFailed] = useState(false);
+  /** Motivo del backend cuando el gestor no concedió la geometría (#179). */
+  const [placementReason, setPlacementReason] = useState<WidgetPlacementReason | null>(null);
+  /** El motivo localizado: el código del backend se traduce con el catálogo (#179). */
+  const placementReasonKey = reasonKey(placementReason);
+  const placementReasonText = placementReasonKey ? t(locale, placementReasonKey) : null;
   const [revealUntil, setRevealUntil] = useState(0);
 
   // reordenar círculos
@@ -171,6 +183,8 @@ export function Widget() {
   const peekRef = useRef<HTMLButtonElement>(null);
   const widgetQueue = useRef(createLatestQueue()).current;
   const widgetBounds = useRef<PhysicalBounds | null>(null);
+  /** True si la geometría cacheada vino del read-back del compositor (X11). */
+  const widgetBoundsReadBack = useRef(false);
   const placementInFlight = useRef(false);
   const orbsRef = useRef<HTMLDivElement>(null);
   const detailStateRef = useRef<DetailState | null>(null);
@@ -204,6 +218,8 @@ export function Widget() {
     }),
   ).current;
   const shown = useRef(false);
+  /** El usuario ocultó la tira desde la bandeja: la visibilidad es suya (#179). */
+  const hiddenByUser = useRef(false);
   const drag = useRef<{ sx: number; sy: number; start: PhysicalPosition | null; sf: number; raf: number; pointerId: number; ending: boolean } | null>(null);
   const orbDrag = useRef<{ id: string; x: number; y: number; moved: boolean } | null>(null);
   const lastReorderAt = useRef(0);
@@ -262,8 +278,9 @@ export function Widget() {
       api.setTrayTooltip(trayTooltip(merged)).catch(() => {});
       runAlerts(prev, merged);
       if (nativeAlertsEnabled(configRef.current?.alerts)) {
+        const loc = localeFrom(configRef.current);
         for (const r of sessionsLost(prev, merged)) {
-          notify(`${r.name}: sesión caducada`, 'Pulsa «Renovar sesión» en su panel. Quorb se actualiza solo en cuanto se renueve.');
+          notify(t(loc, 'widget.sessionExpiredTitle', { name: r.name }), t(loc, 'widget.sessionExpiredBody'));
         }
       }
       setUpdatedAt(new Date());
@@ -326,6 +343,17 @@ export function Widget() {
       }),
       listen('refresh-now', () => refresh()),
       listen('open-peak', () => openPeakRef.current()),
+      // La visibilidad de la tira es del usuario (#179): cuando la oculta
+      // desde la bandeja no se vuelve a mostrar por nuestra cuenta, y cuando
+      // la vuelve a mostrar hay que pedir la colocación de nuevo (la anterior
+      // pudo quedarse sin leer mientras estaba oculta).
+      listen('widget-hidden', () => {
+        hiddenByUser.current = true;
+      }),
+      listen('widget-shown', () => {
+        hiddenByUser.current = false;
+        setPlacementRetry((n) => n + 1);
+      }),
     ];
     return () => {
       controller.abort();
@@ -411,7 +439,8 @@ export function Widget() {
           /* sin almacenamiento */
         }
         if (shouldNotifyUpdate(info.version, store)) {
-          notify(`Quorb ${info.version} disponible`, 'Pulsa el icono de descarga de la tira para actualizar.');
+          const loc = localeFrom(configRef.current);
+          notify(t(loc, 'widget.updateAvailableTitle', { version: info.version }), t(loc, 'widget.updateAvailableBody'));
           setRevealUntil(Date.now() + REVEAL_MS);
         }
       } catch {
@@ -433,7 +462,7 @@ export function Widget() {
       await installUpdate((progress) => setUpdate({ phase: 'installing', info, progress }));
     } catch (e) {
       setUpdate({ phase: 'available', info });
-      notify('No se pudo actualizar Quorb', updateErrorText(e));
+      notify(t(localeFrom(configRef.current), 'widget.updateFailedTitle'), updateErrorText(e));
     }
   };
 
@@ -473,21 +502,53 @@ export function Widget() {
   // Expand before entering; shrink only after the exit transition. Hovering between
   // providers never changes this window, and each native rectangle is applied atomically.
   useEffect(() => {
-    if (dragging) { widgetBounds.current = null; return; }
+    if (dragging) {
+      // El arrastre manda: cancela la estabilización pendiente (#179).
+      try {
+        api.cancelWidgetPlacement().catch(() => {});
+      } catch {
+        /* un backend sin este comando no impide arrastrar */
+      }
+      widgetBounds.current = null;
+      return;
+    }
     if (!geo || !stripSize) return;
     let disposed = false;
     const s = stripRect(geo.area, edge, offset, stripSize.w, stripSize.h);
     const win = usesPeekWindow(phase) ? peekRect(s, edge) : s;
-    const physical = physicalPanelBounds(win, geo.sf);
+    // La petición lleva el borde anclado y el factor con el que se calculó el
+    // rectángulo: con otro tamaño efectivo, el borde se conserva y la
+    // conversión no depende del factor de la ventana (DPI mixto) (#179).
+    const physical = { ...physicalPanelBounds(win, geo.sf), anchor: edge, scale: geo.sf };
     setPos({ strip: { x: s.x - win.x, y: s.y - win.y } });
     placementInFlight.current = true;
     widgetQueue(async (current) => {
       if (disposed || !current()) return;
-      if (!samePhysical(widgetBounds.current, physical)) {
+      let limited = false;
+      let reason: WidgetPlacementReason | null = null;
+      // La comparación con la geometría cacheada usa la tolerancia del
+      // backend **sólo** si esa geometría vino del read-back de X11: en el
+      // resto de plataformas un cambio de 1 px sí es un cambio (#179).
+      const same = samePlacement(widgetBounds.current, physical, widgetBoundsReadBack.current);
+      // El backend es la autoridad: responde con la geometría que quedó en
+      // pantalla, no con la solicitud encolada (#179).
+      const apply = (report: WidgetPlacementReport) => {
+        const outcome = placementOutcome(report, physical);
+        // Sólo se cachea geometría fiable: una colocación cancelada (quedó a
+        // medias) o una lectura fallida dejan la caché vacía.
+        if (outcome.bounds) {
+          widgetBounds.current = outcome.bounds;
+          widgetBoundsReadBack.current = outcome.readBack;
+        }
+        limited = outcome.failed;
+        reason = outcome.reason;
+      };
+      if (!same) {
         widgetBounds.current = null; // Never reuse a cache invalidated by a stale in-flight move.
-        await api.setWidgetBounds(physical);
+        widgetBoundsReadBack.current = false;
+        const report = await api.setWidgetBounds(physical);
         if (disposed || !current()) return;
-        widgetBounds.current = physical;
+        apply(report);
       }
       const surface = usesPeekWindow(phase) ? peekRef.current : stripRef.current;
       if (!surface) throw new Error('Widget surface is not mounted');
@@ -496,14 +557,26 @@ export function Widget() {
       // blur rectangle and no blur-radius change at the start/end of the animation.
       await clipSurfaceSafely(clip, (c) => api.setSurfaceClip(c, !autoHide && phase === 'open'), console.warn, surface);
       if (disposed || !current()) return;
-      if (!shown.current) {
+      if (!shown.current && !hiddenByUser.current) {
+        // La visibilidad es del frontend: el backend nunca muestra la ventana.
         await getCurrentWindow().show();
         if (disposed || !current()) return;
         shown.current = true;
       }
+      // El backend no puede leer una ventana que todavía no es visible: se
+      // vuelve a pedir la colocación para confirmar la geometría (#179).
+      if (!same && reason === 'not_viewable' && !hiddenByUser.current) {
+        const report = await api.setWidgetBounds(physical);
+        if (disposed || !current()) return;
+        apply(report);
+      }
       if (phase === 'preparing' || phase === 'settling') await waitForViewport();
       if (disposed || !current()) return;
       setPlacementFailed(false);
+      // El gestor no concedió la geometría: se informa (con su motivo) y la
+      // tira ofrece reintento.
+      if (limited) setPlacementFailed(true);
+      setPlacementReason(limited ? reason : null);
       if (phase === 'preparing' || phase === 'settling') markPrepared(phase);
     }).catch((error) => {
       if (disposed) return;
@@ -581,6 +654,22 @@ export function Widget() {
     }).catch(console.warn);
     return () => { disposed = true; };
   }, [dragging, geo, autoHide, widgetQueue]);
+
+  // Safety net for the compositor drag (issue #180, maintainer review point
+  // 3): under the compositor's move grab the client may never receive the
+  // closing pointerup, which would leave `dragging` stuck true (detail panel
+  // blocked, auto-hide busy, placement not re-requested). A later buttonless
+  // pointermove is the reliable release signal the webview still sees after
+  // the grab ends. Compositor-only: the native branch owns its release
+  // pipeline in onGripUp and must not be bypassed.
+  useEffect(() => {
+    if (!dragging || currentDragMode() !== 'compositor') return;
+    const release = (e: { buttons: number }) => {
+      if (e.buttons === 0) setDragging(false);
+    };
+    window.addEventListener('pointermove', release);
+    return () => window.removeEventListener('pointermove', release);
+  }, [dragging]);
 
   // The detail window owns its dimensions; hovering never mutates widget geometry.
   useEffect(() => {
@@ -755,6 +844,39 @@ export function Widget() {
       window.clearInterval(interval);
     };
   }, [hovered, presenceRef]);
+  // #180: drag strategy decision, fetched ONCE at mount (single fast
+  // `get_wm_info` command). Two deterministic defaults, both recorded here:
+  // - While the decision is unresolved (`currentDragMode() === null`) the
+  //   grip does nothing: starting the old delta pipeline on a Wayland
+  //   session is precisely the corruption this issue fixes, so the drag is
+  //   BLOCKED instead of guessed. Detection is a fast startup command, so
+  //   blocking until it resolves is deterministic and imperceptible.
+  // - If detection fails, the fallback is Linux-only (#210 review minor):
+  //   Linux degrades to 'compositor' because the gesture cannot touch
+  //   config.json, while Windows/macOS keep 'native' so a one-off probe
+  //   failure never removes their magnet (see fallbackDragMode in
+  //   src/lib/drag-session.ts).
+  // - On unmount the store is cleared so a re-mounted widget re-detects
+  //   instead of inheriting a stale decision.
+  useEffect(() => {
+    let disposed = false;
+    detectWindowManager()
+      .then((info) => {
+        if (disposed) return;
+        // `displayBackend` ships in the get_wm_info response (wm_compat.rs,
+        // WU4 serde camelCase) and the TS mirror declares it typed now (WU5).
+        // Detection failure still falls back to 'compositor' (catch below).
+        setDragMode(dragMode(info.displayBackend).mode);
+      })
+      .catch(() => {
+        if (!disposed) setDragMode(fallbackDragMode(osFromUA(navigator.userAgent)));
+      });
+    return () => {
+      disposed = true;
+      resetDragMode();
+    };
+  }, []);
+
   useEffect(() => {
     dragMounted.current = true;
     return () => {
@@ -768,7 +890,10 @@ export function Widget() {
   // Red de seguridad: si algo falla al medir/colocar, mostramos igualmente la ventana.
   useEffect(() => {
     const t = window.setTimeout(() => {
-      if (!shown.current) {
+      // La visibilidad es del usuario (#179): una tira oculta desde la bandeja
+      // no se vuelve a mostrar por nuestra cuenta, ni siquiera por la red de
+      // seguridad.
+      if (!shown.current && !hiddenByUser.current) {
         shown.current = true;
         getCurrentWindow().show().catch(() => {});
       }
@@ -785,7 +910,26 @@ export function Widget() {
 
   const onGripDown = (e: PointerEvent<HTMLSpanElement>) => {
     if (e.button !== 0 || !geo || !dragMounted.current) return;
+    // #180: until the startup decision is known the grip does nothing (see
+    // the decision effect above for both defaults).
+    const mode = currentDragMode();
+    if (mode == null) return;
     e.preventDefault();
+    if (mode === 'compositor') {
+      // Compositor branch: the drag is delegated to the compositor via the
+      // xdg-shell move gesture. startDragging() consumes the pointerdown
+      // serial itself, so we set up no pointer capture and no `drag.current`
+      // delta state: under xdg-shell the client has no absolute position to
+      // delta from (see onGripUp for the release-side counterpart).
+      setDragging(true);
+      cancelTimers();
+      setHovered(null);
+      getCurrentWindow().startDragging().catch((err) => {
+        setError(String(err));
+        setDragging(false);
+      });
+      return;
+    }
     e.currentTarget.setPointerCapture(e.pointerId);
     if (drag.current) cancelAnimationFrame(drag.current.raf);
     cancelTimers();
@@ -819,6 +963,10 @@ export function Widget() {
   };
 
   const onGripMove = (e: PointerEvent<HTMLSpanElement>) => {
+    // #180: in compositor mode the compositor moves the window during the
+    // gesture, so this is a no-op — early return before any arithmetic or
+    // rAF work. The native branch below keeps today's pipeline untouched.
+    if (currentDragMode() === 'compositor') return;
     const d = drag.current;
     if (!d?.start || d.ending || e.pointerId !== d.pointerId) return;
     const current = () => dragMounted.current && drag.current === d;
@@ -834,6 +982,18 @@ export function Widget() {
   };
 
   const onGripUp = async (e: PointerEvent<HTMLSpanElement>) => {
+    // #180: in compositor mode the compositor owns the grab and the final
+    // position, so this is minimal cleanup only — mirror of the `finally`
+    // below, minus the native snap/persist work: no outerPosition(), no
+    // nearestEdge(), no patchConfig(), no resolveGeo(). In this mode we set
+    // up no pointer capture, no rAF and no `drag.current`, so there is
+    // genuinely nothing else to release; a persisted edge computed from
+    // untrustworthy coordinates would corrupt the config.json that X11
+    // sessions also read.
+    if (currentDragMode() === 'compositor') {
+      setDragging(false);
+      return;
+    }
     const d = drag.current;
     if (!d || d.ending || e.pointerId !== d.pointerId) return;
     d.ending = true;
@@ -946,6 +1106,7 @@ export function Widget() {
       data-auto-hide={showHandle || undefined}
       data-reveal={phase}
       data-placement-failed={placementFailed || undefined}
+      data-placement-reason={placementReason ?? undefined}
       onFocusCapture={() => { setFocused(true); setCollapsed(false); }}
       onBlurCapture={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocused(false); }}
       style={{ '--panel-alpha': String(opacity), '--ring-1': ring1, '--ring-2': ring2, '--ring-3': ring3 } as CSSProperties}
@@ -964,7 +1125,8 @@ export function Widget() {
         ref={peekRef}
         type="button"
         className="peek"
-        aria-label={placementFailed ? 'Reintentar mostrar Quorb' : 'Mostrar Quorb'}
+        aria-label={placementFailed ? `${t(locale, 'widget.retryShow')}${placementReasonText ? `: ${placementReasonText}` : ''}` : t(locale, 'widget.show')}
+        title={placementFailed ? placementReasonText ?? undefined : undefined}
         aria-controls="quorb-strip"
         aria-hidden={phase === 'open' && !peekFocused || undefined}
         tabIndex={phase === 'hidden' || placementFailed && (usesPeekWindow(phase) || phase === 'preparing') ? 0 : -1}
@@ -994,7 +1156,7 @@ export function Widget() {
       >
         <span
           className="strip__grip"
-          title="Arrastrar: se pega al borde más cercano"
+          title={t(locale, 'widget.dragHint')}
           onPointerDown={onGripDown}
           onPointerMove={onGripMove}
           onPointerUp={onGripUp}
@@ -1012,6 +1174,7 @@ export function Widget() {
               size={orbSize}
               active={hovered === r.id}
               account={tags[r.id]}
+              locale={locale}
               showResets={config?.showResets ?? true}
               threshold={config?.alerts.threshold}
               dragging={reorder?.id === r.id}
@@ -1019,18 +1182,9 @@ export function Widget() {
               pointer={orbHandlers(r.id)}
             />
           ))}
-          {visible.length === 0 &&
-            (error ? (
-              <button className="btn btn--accent btn--sm" onClick={retryStartup} title={error}>
-                Reintentar
-              </button>
-            ) : loading || !config ? (
-              <span style={{ color: 'var(--text-2)', fontSize: 11, padding: '0 6px' }}>Cargando…</span>
-            ) : (
-              <button className="btn btn--accent btn--sm" onClick={() => api.openSettings()}>
-                Configurar
-              </button>
-            ))}
+          {visible.length === 0 && (
+            <StripFallback error={error} busy={loading} ready={config != null} locale={locale} onRetry={retryStartup} onConfigure={() => api.openSettings()} />
+          )}
         </div>
 
         <div className="strip__tools">
@@ -1042,17 +1196,17 @@ export function Widget() {
               disabled={update.phase === 'installing'}
               title={
                 update.phase === 'installing'
-                  ? `Actualizando a ${update.info.version}${update.progress != null ? ` · ${update.progress} %` : '…'}`
-                  : `Actualizar a Quorb ${update.info.version}`
+                  ? t(locale, 'widget.updatingTo', { version: update.info.version, detail: update.progress != null ? ` · ${update.progress} %` : '…' })
+                  : t(locale, 'widget.updateTo', { version: update.info.version })
               }
             >
               {Icon.update}
             </button>
           )}
-          <button className="icon-btn" data-spin={loading || undefined} onClick={refresh} title="Actualizar ahora">
+          <button className="icon-btn" data-spin={loading || undefined} onClick={refresh} title={t(locale, 'widget.refreshNow')}>
             {Icon.refresh}
           </button>
-          <button className="icon-btn" onClick={() => api.openSettings()} title="Ajustes">
+          <button className="icon-btn" onClick={() => api.openSettings()} title={t(locale, 'widget.settings')}>
             {Icon.gear}
           </button>
         </div>
