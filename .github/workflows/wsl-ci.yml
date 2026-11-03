@@ -1,0 +1,151 @@
+# CI manual del milestone WSL (#90/#91) — se lanza a mano con
+# `workflow_dispatch` sobre la rama `feat/wsl-adapter` del fork.
+#
+# Cubre lo mismo que `ci.yml` + `linux-pr-ci.yml` (crate real completo,
+# `cargo test --locked`, `npm test`, inventario i18n) y añade `cargo clippy
+# -- -D warnings`, que el CI normal no corre. No se dispara solo: la rama ya
+# tiene su CI en la PR (#220); este es el "más" que se pide al margen.
+#
+# Workspace de cargo: `src-tauri`. El crate necesita las deps de sistema de
+# Tauri en Linux (mismo paquete que `linux-pr-ci.yml`). En Windows el runner
+# trae MSVC y WebView2.
+
+name: WSL CI (manual)
+
+on:
+  # Solo en su propia rama de testeo: este workflow no forma parte de la PR
+  # (#220) ni de main; corre clippy, que el CI normal no ejecuta.
+  push:
+    branches: [wsl-ci-test]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wsl-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests-windows:
+    name: Tests y build (Windows, crate real)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Rust stable (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Rust format is clean
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Install locked frontend dependencies
+        run: npm ci
+
+      - name: Frontend and script tests
+        run: npm test
+
+      - name: i18n text inventory is up to date
+        run: node scripts/i18n-inventory.mjs --check
+
+      - name: Typecheck and build
+        run: npm run build
+
+      - name: Rust tests with locked dependencies
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      # Informe, NO gate: el repo arrastra lints preexistentes en main
+      # (dead_code platform-specific, needless_borrow, doc_lazy_continuation…)
+      # y su CI normal no ejecuta clippy. Con `continue-on-error` el job no
+      # se rompe y los lints quedan visibles en el log para quien los quiera
+      # arreglar. Con `-D warnings` este paso fallaría por lints ajenos a la
+      # rama.
+      - name: Clippy (informe; el repo tiene lints preexistentes)
+        working-directory: src-tauri
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets
+
+  tests-linux:
+    name: Tests y build (Linux, crate real)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Rust stable (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Tauri 2 Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            curl \
+            wget \
+            file \
+            patchelf \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsecret-1-dev \
+            libnotify-dev \
+            libfuse2 \
+            xvfb \
+            dbus \
+            dbus-x11
+
+      - name: Rust format is clean
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Install locked frontend dependencies
+        run: npm ci
+
+      - name: Frontend and script tests
+        run: npm test
+
+      - name: i18n text inventory is up to date
+        run: node scripts/i18n-inventory.mjs --check
+
+      - name: Rust tests with locked dependencies
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      # Informe, NO gate (mismo criterio que el job Windows).
+      - name: Clippy (informe; el repo tiene lints preexistentes)
+        working-directory: src-tauri
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets
