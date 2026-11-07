@@ -1,0 +1,121 @@
+# WSL login evidence — evidencia REAL en Windows + WSL (issue #92, AC9)
+#
+# Laboratorio de evidencia, estilo W3, que se ejecuta en un runner Windows
+# real con WSL2 (windows-latest trae la distro Ubuntu por defecto). Casos que
+# no se pueden simular en Linux ni en unit tests:
+#   GAP1  detección de una CLI presente SOLO dentro de la distro
+#         (`command -v` a través de wsl.exe, sin la CLI en Windows);
+#   GAP2  el comando de login se ejecuta DENTRO de la distro y escribe allí
+#         (marker plantado en el guest);
+#   GAP3  la lectura de sesión lee la ruta EXACTA que la resolución espera
+#         (`<home>/.quorb/accounts/<provider>-<suffix>`) dentro de la distro.
+#
+# Los tests #[ignore = "requiere WSL real"] viven en login.rs (rama de
+# evidencia) y se ejecutan con `--ignored`. Ningún paso toca credenciales
+# reales: los shims y los ficheros de sesión son de prueba y se borran.
+
+name: WSL login evidence (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ref (rama, tag o SHA) a testear'
+        required: false
+        type: string
+        default: 'main'
+
+permissions:
+  contents: read
+
+jobs:
+  wsl-login-evidence:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.3
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+
+      # WSL2 + distro por defecto. windows-latest ya trae wsl.exe con Ubuntu;
+      # si faltara, se instala y se espera al primer arranque.
+      - name: Ensure WSL distro
+        shell: bash
+        run: |
+          set -euo pipefail
+          wsl --list --verbose
+          if ! wsl --list --verbose | grep -qi "Ubuntu"; then
+            wsl --install -d Ubuntu --no-launch
+            sleep 30
+          fi
+          wsl --list --verbose
+          wsl -d Ubuntu -- true
+
+      # Shims REALES dentro de la distro: `codex` y `claude` existen SOLO en
+      # el guest (no en el PATH de Windows): caso del AC1. El shim de codex
+      # escribe un marker para el GAP2.
+      - name: Plant CLI shims inside the distro
+        shell: bash
+        run: |
+          set -euo pipefail
+          wsl -d Ubuntu -- bash -s <<'EOF'
+          set -euo pipefail
+          mkdir -p /usr/local/bin
+          cat > /usr/local/bin/codex <<'SHIM'
+          #!/bin/sh
+          # Shim de evidencia (#92): marca que el login corrió en el guest.
+          printf 'codex-shim\n' > /tmp/quorb-evidence-login
+          exit 0
+          SHIM
+          cat > /usr/local/bin/claude <<'SHIM'
+          #!/bin/sh
+          printf 'claude-shim\n'
+          exit 0
+          SHIM
+          chmod 755 /usr/local/bin/codex /usr/local/bin/claude
+          command -v codex
+          command -v claude
+          EOF
+
+      # Carpeta de sesión de una cuenta adicional DENTRO de la distro, en la
+      # ruta EXACTA de la resolución (#91): <home>/.quorb/accounts/claude-w1/
+      - name: Plant session file inside the distro
+        shell: bash
+        run: |
+          set -euo pipefail
+          wsl -d Ubuntu -- bash -s <<'EOF'
+          set -euo pipefail
+          h=$(getent passwd "$USER" | cut -d: -f6)
+          mkdir -p "$h/.quorb/accounts/claude-w1"
+          printf '{"claudeAiOauth":{"accessToken":"v-evidencia-92"}}' \
+            > "$h/.quorb/accounts/claude-w1/.credentials.json"
+          ls -la "$h/.quorb/accounts/claude-w1/"
+          EOF
+
+      # Los tests #[ignore] de evidencia usan la distro real (RealWslAdapter)
+      # y la variable de entorno de esta sesión.
+      - name: Run WSL login evidence tests (ignored)
+        shell: bash
+        env:
+          QUORB_WSL_EVIDENCE_DISTRO: Ubuntu
+        run: |
+          set -euo pipefail
+          cd src-tauri
+          cargo test --locked login::wsl_evidence:: -- --ignored --nocapture
+
+      - name: Verdict
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GAP1/GAP2/GAP3: PASS si el run termina sin fallos (ver salida de los tests)."
