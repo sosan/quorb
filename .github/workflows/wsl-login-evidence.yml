@@ -1,18 +1,16 @@
 # WSL login evidence — evidencia REAL en Windows + WSL (issue #92, AC9)
 #
-# Laboratorio de evidencia, estilo W3, que se ejecuta en un runner Windows
-# real con WSL2 (windows-latest trae la distro Ubuntu por defecto). Casos que
-# no se pueden simular en Linux ni en unit tests:
+# Lab de evidencia (rama propia del fork, no entra en la PR). Runner Windows
+# real + WSL2 con una distro Ubuntu importada desde el rootfs oficial:
 #   GAP1  detección de una CLI presente SOLO dentro de la distro
-#         (`command -v` a través de wsl.exe, sin la CLI en Windows);
-#   GAP2  el comando de login se ejecuta DENTRO de la distro y escribe allí
-#         (marker plantado en el guest);
-#   GAP3  la lectura de sesión lee la ruta EXACTA que la resolución espera
-#         (`<home>/.quorb/accounts/<provider>-<suffix>`) dentro de la distro.
+#         (`command -v` por wsl.exe, sin la CLI en Windows);
+#   GAP2  el comando de login corre DENTRO del guest y escribe allí (marker);
+#   GAP3  la sesión se lee en la ruta EXACTA que la resolución espera
+#         (`<home>/.quorb/accounts/<provider>-<suffix>`).
 #
-# Los tests #[ignore = "requiere WSL real"] viven en login.rs (rama de
-# evidencia) y se ejecutan con `--ignored`. Ningún paso toca credenciales
-# reales: los shims y los ficheros de sesión son de prueba y se borran.
+# Los tests #[ignore] viven en login.rs y se ejecutan con `--ignored`.
+# Ningún paso toca credenciales reales. Los scripts del guest se escriben con
+# finales de línea LF: con CRLF, `/bin/sh` recibe `-eu\r` y aborta.
 
 name: WSL login evidence (manual)
 
@@ -31,53 +29,56 @@ permissions:
 jobs:
   wsl-login-evidence:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.3
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           package-manager-cache: false
 
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
 
-      # Distro REAL importada desde un rootfs Alpine fijado (patrón W0,
-      # sha256 verificado): windows-latest no trae distro preinstalada.
-      - name: Prepare pinned Alpine rootfs (sha256-verified)
+      # Distro Ubuntu REAL importada desde el rootfs oficial (no Alpine).
+      # El nombre exacto del tarball se toma de SHA256SUMS (no se fija a mano):
+      # si aparece un punto de release nuevo, el lab sigue funcionando.
+      - name: Download ubuntu-base rootfs + official checksums
         shell: pwsh
         run: |
-          $url = "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz"
-          $expected = "d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c"
-          Invoke-WebRequest -Uri $url -OutFile rootfs.tar.gz
-          $hash = (Get-FileHash rootfs.tar.gz -Algorithm SHA256).Hash.ToLower()
-          if ($hash -ne $expected) { throw "HASH MISMATCH: $hash" }
-          Write-Host "rootfs OK ($hash)"
+          $base = "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release"
+          Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile SHA256SUMS
+          $line = Get-Content SHA256SUMS |
+            Where-Object { $_ -match "\*?ubuntu-base-22\.04\.\d+-base-amd64\.tar\.gz$" } |
+            Select-Object -First 1
+          if (-not $line) { throw "SHA256SUMS sin entrada ubuntu-base 22.04 amd64" }
+          $parts = $line -split "\s+"
+          $expected = $parts[0]
+          $file = $parts[1].TrimStart("*")
+          Invoke-WebRequest -Uri "$base/$file" -OutFile ubuntu-base.tar.gz
+          $actual = (Get-FileHash ubuntu-base.tar.gz -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "HASH MISMATCH: $actual != $expected" }
+          Write-Host "rootfs OK ($file, $actual)"
 
-      # Import con el patrón EXACTO del lab W0 (pwsh + wsl.exe --import):
-      # desde bash, el import devuelve Wsl/ERROR_PATH_NOT_FOUND.
-      - name: Import the evidence distro
+      - name: Import the Ubuntu evidence distro
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path C:\wsl | Out-Null
-          & wsl.exe --import quorb_e92 C:\wsl\e92 rootfs.tar.gz *>&1 |
-            Tee-Object -FilePath import.txt
-          if ($LASTEXITCODE -ne 0) { Get-Content import.txt; exit 1 }
-          & wsl.exe -d quorb_e92 -- true
-          & wsl.exe --list --verbose
+          & wsl.exe --import quorb-e92 C:\wsl\e92 ubuntu-base.tar.gz
+          & wsl.exe -d quorb-e92 -- bash -lc "id && echo listo"
 
-      # Shims y fichero de sesión DENTRO de la distro. El script se pasa por
-      # stdin (`sh -s`): sin quoting de rutas del host.
+      # Script del guest escrito con LF y ejecutado por la ruta montada
+      # (/mnt/<unidad>/...): evita el CRLF de PowerShell y el stdin.
       - name: Plant CLI shims and session file inside the distro
         shell: pwsh
         run: |
-          @'
+          $script = @'
           set -euo pipefail
           mkdir -p /usr/local/bin
           cat > /usr/local/bin/codex <<'SHIM'
@@ -96,15 +97,17 @@ jobs:
           mkdir -p /root/.quorb/accounts/claude-w1
           printf '{"claudeAiOauth":{"accessToken":"v-evidencia-92"}}' > /root/.quorb/accounts/claude-w1/.credentials.json
           ls -la /root/.quorb/accounts/claude-w1/
-          '@ | Set-Content -Encoding utf8NoBOM setup.sh
-          Get-Content setup.sh -Raw | wsl.exe -d quorb_e92 -- sh -s
+          '@
+          $lf = $script -replace "`r`n", "`n"
+          [IO.File]::WriteAllText("$PWD/setup.sh", $lf, (New-Object Text.UTF8Encoding($false)))
+          $ws = "$env:GITHUB_WORKSPACE".Replace("\", "/")
+          $guest = $ws -replace "^([A-Za-z]):", "/mnt/`$1"
+          wsl.exe -d quorb-e92 -- bash "$guest/setup.sh"
 
-      # Los tests #[ignore] de evidencia usan la distro real (RealWslAdapter)
-      # y la variable de entorno de esta sesión.
       - name: Run WSL login evidence tests (ignored)
         shell: bash
         env:
-          QUORB_WSL_EVIDENCE_DISTRO: quorb_e92
+          QUORB_WSL_EVIDENCE_DISTRO: quorb-e92
         run: |
           set -euo pipefail
           cd src-tauri
