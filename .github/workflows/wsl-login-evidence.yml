@@ -48,28 +48,35 @@ jobs:
         with:
           toolchain: stable
 
-      # WSL2 + distro por defecto. windows-latest ya trae wsl.exe con Ubuntu;
-      # si faltara, se instala y se espera al primer arranque.
-      - name: Ensure WSL distro
+      # Distro REAL importada desde un rootfs Alpine fijado (patrón W0,
+      # sha256 verificado): windows-latest no trae distro preinstalada.
+      - name: Prepare pinned Alpine rootfs (sha256-verified)
+        shell: pwsh
+        run: |
+          $url = "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz"
+          $expected = "d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c"
+          Invoke-WebRequest -Uri $url -OutFile rootfs.tar.gz
+          $hash = (Get-FileHash rootfs.tar.gz -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $expected) { throw "HASH MISMATCH: $hash" }
+          Write-Host "rootfs OK ($hash)"
+
+      - name: Import the evidence distro
         shell: bash
         run: |
           set -euo pipefail
+          wsl.exe --import quorb_e92 C:\\wsl\\e92 rootfs.tar.gz
+          # primer arranque + usuario root para los shims
+          wsl -d quorb_e92 -- true
           wsl --list --verbose
-          if ! wsl --list --verbose | grep -qi "Ubuntu"; then
-            wsl --install -d Ubuntu --no-launch
-            sleep 30
-          fi
-          wsl --list --verbose
-          wsl -d Ubuntu -- true
 
       # Shims REALES dentro de la distro: `codex` y `claude` existen SOLO en
       # el guest (no en el PATH de Windows): caso del AC1. El shim de codex
-      # escribe un marker para el GAP2.
-      - name: Plant CLI shims inside the distro
+      # escribe un marker para el GAP2. El home de root en Alpine es /root.
+      - name: Plant CLI shims and session file inside the distro
         shell: bash
         run: |
           set -euo pipefail
-          wsl -d Ubuntu -- bash -s <<'EOF'
+          wsl -d quorb_e92 -- sh -s <<'EOF'
           set -euo pipefail
           mkdir -p /usr/local/bin
           cat > /usr/local/bin/codex <<'SHIM'
@@ -86,21 +93,9 @@ jobs:
           chmod 755 /usr/local/bin/codex /usr/local/bin/claude
           command -v codex
           command -v claude
-          EOF
-
-      # Carpeta de sesión de una cuenta adicional DENTRO de la distro, en la
-      # ruta EXACTA de la resolución (#91): <home>/.quorb/accounts/claude-w1/
-      - name: Plant session file inside the distro
-        shell: bash
-        run: |
-          set -euo pipefail
-          wsl -d Ubuntu -- bash -s <<'EOF'
-          set -euo pipefail
-          h=$(getent passwd "$USER" | cut -d: -f6)
-          mkdir -p "$h/.quorb/accounts/claude-w1"
-          printf '{"claudeAiOauth":{"accessToken":"v-evidencia-92"}}' \
-            > "$h/.quorb/accounts/claude-w1/.credentials.json"
-          ls -la "$h/.quorb/accounts/claude-w1/"
+          mkdir -p /root/.quorb/accounts/claude-w1
+          printf '{"claudeAiOauth":{"accessToken":"v-evidencia-92"}}' > /root/.quorb/accounts/claude-w1/.credentials.json
+          ls -la /root/.quorb/accounts/claude-w1/
           EOF
 
       # Los tests #[ignore] de evidencia usan la distro real (RealWslAdapter)
@@ -108,7 +103,7 @@ jobs:
       - name: Run WSL login evidence tests (ignored)
         shell: bash
         env:
-          QUORB_WSL_EVIDENCE_DISTRO: Ubuntu
+          QUORB_WSL_EVIDENCE_DISTRO: quorb_e92
         run: |
           set -euo pipefail
           cd src-tauri
