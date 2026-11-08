@@ -60,28 +60,28 @@ jobs:
           if ($hash -ne $expected) { throw "HASH MISMATCH: $hash" }
           Write-Host "rootfs OK ($hash)"
 
+      # Import con el patrón EXACTO del lab W0 (pwsh + wsl.exe --import):
+      # desde bash, el import devuelve Wsl/ERROR_PATH_NOT_FOUND.
       - name: Import the evidence distro
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          wsl.exe --import quorb_e92 C:\\wsl\\e92 rootfs.tar.gz
-          # primer arranque + usuario root para los shims
-          wsl -d quorb_e92 -- true
-          wsl --list --verbose
+          New-Item -ItemType Directory -Force -Path C:\wsl | Out-Null
+          & wsl.exe --import quorb_e92 C:\wsl\e92 rootfs.tar.gz *>&1 |
+            Tee-Object -FilePath import.txt
+          if ($LASTEXITCODE -ne 0) { Get-Content import.txt; exit 1 }
+          & wsl.exe -d quorb_e92 -- true
+          & wsl.exe --list --verbose
 
-      # Shims REALES dentro de la distro: `codex` y `claude` existen SOLO en
-      # el guest (no en el PATH de Windows): caso del AC1. El shim de codex
-      # escribe un marker para el GAP2. El home de root en Alpine es /root.
+      # Shims y fichero de sesión DENTRO de la distro. El script se pasa por
+      # stdin (`sh -s`): sin quoting de rutas del host.
       - name: Plant CLI shims and session file inside the distro
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          wsl -d quorb_e92 -- sh -s <<'EOF'
+          @'
           set -euo pipefail
           mkdir -p /usr/local/bin
           cat > /usr/local/bin/codex <<'SHIM'
           #!/bin/sh
-          # Shim de evidencia (#92): marca que el login corrió en el guest.
           printf 'codex-shim\n' > /tmp/quorb-evidence-login
           exit 0
           SHIM
@@ -96,7 +96,8 @@ jobs:
           mkdir -p /root/.quorb/accounts/claude-w1
           printf '{"claudeAiOauth":{"accessToken":"v-evidencia-92"}}' > /root/.quorb/accounts/claude-w1/.credentials.json
           ls -la /root/.quorb/accounts/claude-w1/
-          EOF
+          '@ | Set-Content -Encoding utf8NoBOM setup.sh
+          Get-Content setup.sh -Raw | wsl.exe -d quorb_e92 -- sh -s
 
       # Los tests #[ignore] de evidencia usan la distro real (RealWslAdapter)
       # y la variable de entorno de esta sesión.
