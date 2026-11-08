@@ -56,6 +56,7 @@ jobs:
           Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile SHA256SUMS
           $line = Get-Content SHA256SUMS |
             Where-Object { $_ -match "\*?ubuntu-base-22\.04\.\d+-base-amd64\.tar\.gz$" } |
+            Sort-Object -Property { ($_ -split "\s+")[1] } -Descending |
             Select-Object -First 1
           if (-not $line) { throw "SHA256SUMS sin entrada ubuntu-base 22.04 amd64" }
           $parts = $line -split "\s+"
@@ -100,9 +101,33 @@ jobs:
           '@
           $lf = $script -replace "`r`n", "`n"
           [IO.File]::WriteAllText("$PWD/setup.sh", $lf, (New-Object Text.UTF8Encoding($false)))
-          $ws = "$env:GITHUB_WORKSPACE".Replace("\", "/")
-          $guest = $ws -replace "^([A-Za-z]):", "/mnt/`$1"
+          # `/mnt/d`, no `/mnt/D`: el punto de montaje de WSL es la unidad en
+          # minúscula y Linux distingue mayúsculas.
+          $ws = "$env:GITHUB_WORKSPACE".Replace("\", "/").ToLower()
+          $guest = $ws -replace "^([a-z]):", "/mnt/`$1"
           wsl.exe -d quorb-e92 -- bash "$guest/setup.sh"
+
+      # La compilación tarda minutos y WSL detiene la distro ociosa: si se
+      # llega a los tests con la distro Stopped, `cli_check` responde Stopped
+      # (por diseño no la despierta) y GAP1 fallaría. Se compila ANTES y se
+      # mantiene la distro viva durante los tests con un proceso dormido.
+      - name: Build the test binary (distro not needed yet)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src-tauri
+          cargo test --locked --no-run
+
+      - name: Keep the distro running during the tests
+        shell: pwsh
+        run: |
+          # WSL_UTF8=1 (F1): sin él, wsl.exe escribe UTF-16LE y PowerShell 7
+          # decodifica basura; con él la lista es UTF-8 y «Running» es legible.
+          $env:WSL_UTF8 = "1"
+          Start-Process -FilePath wsl.exe -ArgumentList '-d','quorb-e92','--','sleep','900'
+          Start-Sleep -Seconds 3
+          & wsl.exe --list --verbose
+          if (-not ((& wsl.exe --list --verbose) -match 'Running')) { throw "la distro no está Running" }
 
       - name: Run WSL login evidence tests (ignored)
         shell: bash
