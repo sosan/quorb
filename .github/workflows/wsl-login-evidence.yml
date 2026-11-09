@@ -138,8 +138,40 @@ jobs:
           cd src-tauri
           cargo test --locked login::wsl_evidence:: -- --ignored --nocapture
 
+      # Binario de PRODUCCIÓN (no el harness de tests): valida que el
+      # ejecutable que se entrega compila y enlaza con el código de #92.
+      # `dist/` está en el repo, así que `tauri::generate_context!` resuelve
+      # `frontendDist`.
+      - name: Build the real app binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src-tauri
+          cargo build --locked
+          ls -l target/debug/quorb.exe
+
+      # Arranque/parada del .exe: comprueba que el binario real no crashea al
+      # iniciar (plugins, tray, WebView2). Sin sesión de escritorio esto no
+      # valida la GUI: solo que el proceso vive y se cierra limpiamente.
+      - name: Launch smoke of the real binary
+        shell: pwsh
+        run: |
+          $exe = "src-tauri\target\debug\quorb.exe"
+          if (-not (Test-Path $exe)) { throw "no se generó quorb.exe" }
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 15
+          if ($p.HasExited) {
+            throw "quorb.exe terminó al arrancar (exit $($p.ExitCode))"
+          }
+          if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) {
+            throw "quorb.exe ya no está vivo"
+          }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "arranque OK (pid $($p.Id)); proceso detenido"
+
       - name: Verdict
         shell: bash
         run: |
           set -euo pipefail
           echo "GAP1/GAP2/GAP3: PASS si el run termina sin fallos (ver salida de los tests)."
+          echo "Binario real: build + arranque/parada OK si los pasos anteriores pasan."
