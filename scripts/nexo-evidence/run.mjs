@@ -113,12 +113,43 @@ try {
   await transcript.waitFor(/^Registered app: /, 'el re-registro tras la caída', { from });
   console.log('· la app volvió a registrarse tras la caída');
 
-  from = transcript.mark();
-  send('q');
-  await transcript.waitFor(/^-> .*"type":"quit"/, 'a que el hub pida el «Salir»', { from, timeout: 30_000 });
-  await transcript.waitFor(/^<- .*"type":"quit_result"/, 'el resultado del «Salir»', { from, timeout: 60_000 });
+  // La decisión del «Salir» se despacha al hilo de UI. Ese hilo está creando la
+  // ventana del selector justo después de registrarse, así que preguntar de
+  // inmediato llega antes de que pueda atender: el plugin rechaza a los 9 s por
+  // su propio plazo. Se espera a que el arranque se asiente y, si aun así
+  // rechaza por plazo, se reintenta una vez (el hub incrementa el id en cada
+  // petición, así que el reintento es un «Salir» nuevo).
+  const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const quitFrame = () => {
+    const line = transcript.lines.filter((l) => /^<- .*"type":"quit_result"/.test(l)).at(-1);
+    if (!line) return null;
+    try {
+      return JSON.parse(line.slice(line.indexOf('{')));
+    } catch {
+      return null;
+    }
+  };
+
+  await settle(6_000);
+  let attempts = 0;
+  for (;;) {
+    attempts += 1;
+    from = transcript.mark();
+    send('q');
+    await transcript.waitFor(/^-> .*"type":"quit"/, 'a que el hub pida el «Salir»', { from, timeout: 30_000 });
+    await transcript.waitFor(/^<- .*"type":"quit_result"/, 'el resultado del «Salir»', { from, timeout: 60_000 });
+    const result = quitFrame();
+    if (result?.accepted === true) break;
+    // `false` aquí es el plazo del plugin, no una decisión del host: se reintenta.
+    if (attempts < 2) {
+      console.log(`· el hub rechazó por plazo (${result?.reason ?? 'sin motivo'}); reintento`);
+      await settle(6_000);
+      continue;
+    }
+    throw new Error(`el «Salir» no se aceptó tras ${attempts} intentos: ${result?.reason ?? 'sin motivo'}`);
+  }
   await transcript.waitFor(/^<- .*"type":"bye"/, 'la despedida de la app', { from, timeout: 30_000 });
-  console.log('· «Salir» respondido y app despedida');
+  console.log(`· «Salir» aceptado y app despedida (intento ${attempts})`);
 
   const deadline = Date.now() + 60_000;
   while (appExit === null && Date.now() < deadline) {
